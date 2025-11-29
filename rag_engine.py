@@ -1,6 +1,7 @@
 # rag_engine.py
 import os
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"  # 使用国内镜像
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com" # 使用国内镜像
+
 import logging
 from typing import List, Optional
 from langchain_community.document_loaders import TextLoader
@@ -11,8 +12,8 @@ from langchain_qdrant import Qdrant
 from langchain.retrievers import ContextualCompressionRetriever
 from langchain.retrievers.document_compressors import CrossEncoderReranker
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 import torch
@@ -150,11 +151,19 @@ class MedicalRAG:
         chunks = text_splitter.split_documents(documents)
 
         print(f"共生成 {len(chunks)} 个文本块，正在构建向量库...")
+        # self.vector_store = Qdrant.from_documents(
+        #     chunks,
+        #     self.embedding_model,
+        #     location=":memory:",
+        #     collection_name=self.collection_name
+        # )
+        #  Qdrant ，改用磁盘持久化
         self.vector_store = Qdrant.from_documents(
             chunks,
             self.embedding_model,
-            location=":memory:",
-            collection_name=self.collection_name
+            path="./qdrant_db",  # 持久化到本地目录
+            collection_name=self.collection_name,
+            force_recreate=False  # 避免重复覆盖（可选）
         )
 
         base_retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
@@ -177,33 +186,95 @@ class MedicalRAG:
             print(f"原始查询: {query} → 重写后: {rewritten}")
         return rewritten
 
+#     def _build_rag_chain(self):
+#         prompt_template = """
+# 你是一名专业医疗助手，请严格依据以下医学资料回答问题。
+# 如果资料中无相关信息，请回答："根据当前知识库无法回答该问题"。
+#
+# 【医学资料】
+# {context}
+#
+# 【问题】
+# {question}
+#
+# 【要求】
+# 1. 回答必须准确、简洁；
+# 2. 必须注明资料来源（如文件名或指南名称）；
+# 3. 禁止任何猜测、编造或超出资料范围的建议。
+# """
+#         prompt = ChatPromptTemplate.from_template(prompt_template)
+#
+#         self.rag_chain = (
+#                 {
+#                     "context": lambda x: self.retriever.invoke(self._rewrite_query(x["question"])),
+#                     "question": lambda x: x["question"]
+#                 }
+#                 | prompt
+#                 | self.llm
+#                 | StrOutputParser()
+#         )
+
     def _build_rag_chain(self):
+        def format_docs_with_sources(docs):
+            if not docs or all(not doc.page_content.strip() for doc in docs):
+                return {"context": "", "sources": ""}
+            context = "\n\n".join(doc.page_content for doc in docs)
+            sources = sorted(set(doc.metadata.get("source", "未知来源") for doc in docs))
+            return {"context": context, "sources": "、".join(sources)}
+
         prompt_template = """
-你是一名专业医疗助手，请严格依据以下医学资料回答问题。
-如果资料中无相关信息，请回答："根据当前知识库无法回答该问题"。
+    你是一名专业医疗助手，请严格依据以下医学资料回答问题。
+    如果资料中无相关信息，请回答："根据当前知识库无法回答该问题"。
 
-【医学资料】
-{context}
+    【医学资料】
+    {context}
 
-【问题】
-{question}
+    【问题】
+    {question}
 
-【要求】
-1. 回答必须准确、简洁；
-2. 必须注明资料来源（如文件名或指南名称）；
-3. 禁止任何猜测、编造或超出资料范围的建议。
-"""
+    【要求】
+    1. 回答必须准确、简洁；
+    2. 禁止任何猜测、编造或超出资料范围的建议。
+    """
         prompt = ChatPromptTemplate.from_template(prompt_template)
 
-        self.rag_chain = (
-                {
-                    "context": lambda x: self.retriever.invoke(self._rewrite_query(x["question"])),
-                    "question": lambda x: x["question"]
-                }
-                | prompt
-                | self.llm
-                | StrOutputParser()
+        # ✅ 显式将输入字符串包装为 dict
+        input_mapper = RunnableLambda(
+            lambda question_str: {
+                "rewritten_q": self._rewrite_query(question_str),
+                "original_q": question_str
+            }
         )
 
+        base_chain = (
+                input_mapper
+                | {
+                    "docs": lambda x: self.retriever.invoke(x["rewritten_q"]),
+                    "question": lambda x: x["original_q"],
+                }
+                | {
+                    "info": lambda x: format_docs_with_sources(x["docs"]),
+                    "question": lambda x: x["question"],
+                }
+                | {
+                    "context": lambda x: x["info"]["context"],
+                    "sources": lambda x: x["info"]["sources"],
+                    "question": lambda x: x["question"],
+                }
+                | {
+                    "answer": prompt | self.llm | StrOutputParser(),
+                    "sources": lambda x: x["sources"],
+                }
+        )
+
+        def finalize_output(inputs):
+            answer = inputs["answer"]
+            sources = inputs["sources"]
+            if not sources or "根据当前知识库无法回答" in answer:
+                return answer
+            return f"{answer}\n\n（资料来源：{sources}）"
+
+        self.rag_chain = base_chain | RunnableLambda(finalize_output)
+
     def ask(self, question: str) -> str:
-        return self.rag_chain.invoke({"question": question})
+        return self.rag_chain.invoke(question)  # 直接传字符串
