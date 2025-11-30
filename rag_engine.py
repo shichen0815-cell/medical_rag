@@ -217,8 +217,8 @@ class MedicalRAG:
             force_recreate=True  # 避免重复覆盖（可选）
         )
 
-        base_retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
-        compressor = CrossEncoderReranker(model=self.reranker, top_n=3)
+        base_retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})#k（召回文档数）
+        compressor = CrossEncoderReranker(model=self.reranker, top_n=3)#只返回最相关 3 条文本的 retriever
         self.retriever = ContextualCompressionRetriever(
             base_compressor=compressor,
             base_retriever=base_retriever
@@ -272,7 +272,7 @@ class MedicalRAG:
 
         # 2. 打印重排后的文本（即 retriever 输出）
         def retrieve_and_log(x):
-            docs = self.retriever.invoke(x["rewritten_q"])
+            docs = self.retriever.invoke(x["rewritten_q"])#todo
             print("\n重排后返回的文本块（Top 3）:")
             for i, doc in enumerate(docs, 1):
                 content = doc.page_content.strip()[:200].replace('\n', ' ')
