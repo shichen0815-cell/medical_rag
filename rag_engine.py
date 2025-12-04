@@ -18,6 +18,7 @@ from langchain_core.output_parsers import StrOutputParser
 # from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from qdrant_client import QdrantClient
 from qdrant_client.http.exceptions import UnexpectedResponse
+from langchain_core.prompts import ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
 import torch
 from transformers import (
     AutoTokenizer,
@@ -163,9 +164,9 @@ class MedicalRAG:
                 model=model,
                 tokenizer=tokenizer,
                 max_new_tokens=256,
-                temperature=0.3,
+                temperature=0.0,
                 do_sample=False,
-                repetition_penalty=1.1
+                repetition_penalty=1.2
             )
             self.llm = HuggingFacePipeline(pipeline=pipe)
         except Exception as e:
@@ -314,11 +315,30 @@ class MedicalRAG:
 （简要列出来自 Context 的依据，不生成新内容）
 """
         prompt = ChatPromptTemplate.from_template(prompt_template)
+        # ------ Query Rewrite ------
+        query_rewrite_prompt = ChatPromptTemplate.from_messages([
+            SystemMessagePromptTemplate.from_template(
+                "你是一个医学查询规范化引擎。你的任务是将用户输入的医学问题改写为标准、简洁、规范的医学问句。"
+                "你必须遵守以下规则：\n"
+                "1. 仅输出改写后的问题，不要任何解释、前缀、后缀、标点引导（如“改写后：”、“答案：”等）。\n"
+                "2. 不要回答问题，不要添加知识，不要生成 JSON 或 Markdown。\n"
+                "3. 如果输入已是规范表达，直接原样输出，不做任何修改。\n"
+                "4. 输出必须是单行文本，以问号结尾（如原问题有问号）或保持陈述句（如原问题无问号）。\n"
+                "5. **绝对不要开启多轮对话，不要复述指令，不要自我确认。**"
+            ),
+            HumanMessagePromptTemplate.from_template("{query}")
+        ])
+
+        query_rewriter_chain = (
+                query_rewrite_prompt
+                | self.llm
+                | StrOutputParser()
+        )
 
         def log_and_rewrite(question_str):
             logger.debug(f"原始查询: {question_str}")
-            rewritten = self._rewrite_query(question_str)
-            logger.debug(f"重写后查询: {rewritten}")
+            rewritten = query_rewriter_chain.invoke({"query": question_str})
+            logger.info(f"查询重写-----Query Rewrite: {question_str} → {rewritten}")
             return {"rewritten_q": rewritten, "original_q": question_str}
 
         input_mapper = RunnableLambda(log_and_rewrite)
