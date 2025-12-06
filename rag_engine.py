@@ -71,7 +71,7 @@ class MedicalRAG:
         self._auto_convert_pdfs()
         self.collection_name = collection_name
         self._init_models()
-        self._init_rewrite_llm()
+        self._init_rewrite_llm()#必须在主模型后，如不设置重写模型可以使用主模型
         # ===== 初始化图检索器（新增一行）=====
         self.graph_retriever = GraphRetriever() if GRAPH_RETRIEVER_AVAILABLE else None
 
@@ -312,6 +312,7 @@ class MedicalRAG:
     def _hybrid_retrieve(self, query: str) -> List:
         """混合检索：向量 + 图 → 合并 → 统一 rerank"""
         # 1. 向量检索（原始相似性）
+        logger.info(f"混合检索接收到查询： {query}")
         vector_docs = self.vector_store.similarity_search(query, k=5)
 
         # 2. 图检索（如有）
@@ -461,9 +462,9 @@ class MedicalRAG:
             }
 
         base_chain = (
-                input_mapper
-                | RunnableLambda(retrieve_and_log)
-                | RunnableLambda(prepare_prompt_input)
+                input_mapper #查询重写
+                | RunnableLambda(retrieve_and_log) #混合检索
+                | RunnableLambda(prepare_prompt_input) #主查询
                 | {
                     "answer": prompt | self.llm | StrOutputParser(),
                     "sources": lambda x: x["sources"],
