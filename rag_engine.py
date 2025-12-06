@@ -320,6 +320,8 @@ class MedicalRAG:
         if self.graph_retriever:
             try:
                 graph_docs = self.graph_retriever.retrieve(query)
+                for doc in graph_docs:
+                    logger.info(f"  图检索 : {doc.page_content}")
             except Exception as e:
                 logger.error(f"图检索异常（已跳过）: {e}")
 
