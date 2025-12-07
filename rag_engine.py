@@ -72,7 +72,7 @@ class MedicalRAG:
         self.collection_name = collection_name
         self._init_models()
         self._init_rewrite_llm()#必须在主模型后，如不设置重写模型可以使用主模型
-        # ===== 初始化图检索器（新增一行）=====
+        # ===== 初始化图检索器 =====
         self.graph_retriever = GraphRetriever() if GRAPH_RETRIEVER_AVAILABLE else None
 
         try:
