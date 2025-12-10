@@ -1,20 +1,20 @@
 总结：
 如果你要确定“最重要的指标”，按重要性排序如下：
-核心指标（必须达标）⭐⭐
-    Recall（召回率）
-    Faithfulness（忠实性）
-    Factual Accuracy（医学正确性）
-    Hallucination Rate（幻觉率）
-    Medical Risk Score（医疗风险）
+    核心指标（必须达标）⭐⭐
+        Recall（召回率）
+        Faithfulness（忠实性）
+        Factual Accuracy（医学正确性）
+        Hallucination Rate（幻觉率）
+        Medical Risk Score（医疗风险）
 
-    次重要指标
-    Coverage（知识覆盖率）
-    Precision@k
-    Groundedness
+    次重要指标⭐
+        Coverage（知识覆盖率）
+        Precision （精准率）
+        Groundedness （依据程度）
     可选指标
-    Readability
-    Consistency
-    Latency
+        Readability （可读性）
+        Consistency（一致性）
+        Latency（检索延迟）
 
 
 I. 检索层指标（Retrieval Metrics）【最重要的：召回率、知识覆盖率】
