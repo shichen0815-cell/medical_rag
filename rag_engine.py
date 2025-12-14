@@ -266,6 +266,8 @@ class MedicalRAG:
             )
 
             # ========= 3. 远程 + 本地安全降级 =========
+            #SGLang（经过验证了），vLLM在本地不可使用，缺少cuda，不能在macos上使用。
+            #转而自己的使用自己的极简 FastAPI Server
             class RewriteWithFallback(Runnable):
                 def invoke(self, input: str, **kwargs) -> str:
                     try:
