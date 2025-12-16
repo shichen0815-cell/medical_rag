@@ -39,7 +39,7 @@ if not logger.handlers:
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)  # 可根据需要调整为 logging.DEBUG
 
-logger.propagate = False#防止打印两遍日志
+# logger.propagate = False#防止打印两遍日志
 # 禁用部分 noisy 日志（可选）
 logging.getLogger("langchain").setLevel(logging.ERROR)
 os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
@@ -282,51 +282,55 @@ class MedicalRAG:
                         type(input),
                         input
                     )
-                    # ===== 1. 统一抽取 query（兼容 LangChain）=====
+                    # ===== 1. 保留 ChatPromptValue 的完整结构 =====
                     if isinstance(input, ChatPromptValue):
-                        messages = input.to_messages()
-                        human_msgs = [m for m in messages if m.type == "human"]
-                        query = human_msgs[-1].content if human_msgs else messages[-1].content
+                        prompt_input = input
                         logger.debug(
-                            "Rewrite extracted query from ChatPromptValue: %s",
-                            query
+                            "Rewrite received ChatPromptValue, messages=%d",
+                            len(input.to_messages())
                         )
                     else:
-                        query = str(input)
+                        prompt_input = ChatPromptValue.from_messages([
+                            ("human", str(input))
+                        ])
                         logger.debug(
-                            "Rewrite extracted query from str input: %s",
-                            query
+                            "Rewrite extracted prompt_input from str ChatPromptValue: %s",
+                            prompt_input
                         )
 
-                    # ===== 2. 远端 Rewrite =====
+                    # ===== 2. 远端优先 =====
                     try:
                         start = time.time()
-                        content = remote_llm.invoke(query)
+                        content = remote_llm.invoke(prompt_input)
                         latency = time.time() - start
-
                         logger.info(
                             "Rewrite remote success, latency=%.2fs, resp_type=%s, output=%s",
                             latency,
                             type(content),
                             content
                         )
+                        if isinstance(content, BaseMessage):
+                            text = content.content
+                        else:
+                            text = str(content)
 
-                        return content.strip()
+                        return text.strip()
 
                     except Exception as e:
-                        logger.warning(
-                            "Rewrite LLM fallback to local, reason=%s, query=%s",
-                            e,
-                            query
-                        )
-                        local_out = local_llm.invoke(query)
+                        if isinstance(prompt_input, ChatPromptValue):
+                            local_prompt = prompt_input.to_string()
+                        else:
+                            local_prompt = str(prompt_input)
+
+                        logger.warning("Rewrite fallback to local, reason=%s, query=%s", e, local_prompt)
+                        local_out = local_llm.invoke(local_prompt)
 
                         logger.info(
                             "Rewrite LOCAL result=%s",
                             local_out
                         )
+                        return local_out.strip()
 
-                        return local_out
 
             self.rewrite_llm = RewriteWithFallback()
             logger.info("Rewrite LLM 使用策略：FastAPI 远程优先 + 本地 fallback")

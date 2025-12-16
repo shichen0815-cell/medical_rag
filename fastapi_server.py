@@ -7,53 +7,58 @@ from contextlib import asynccontextmanager
 import os
 import logging
 from datetime import datetime
+from typing import List, Dict
 
-# 配置日志器（模块级）
-# 配置更详细的日志格式
+# ----------------------------------------------------------------------
+# Logging configuration（仅在入口配置一次，避免双打印）
+# ----------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler('./logs/prompt_logs.log'),  # 同时输出到文件
-        logging.StreamHandler()
-    ]
+        logging.FileHandler("./logs/prompt_logs.log"),
+        logging.StreamHandler(),
+    ],
 )
-logger = logging.getLogger(__name__)
-logger.info(f"HF_ENDPOINT set to: {os.environ.get('HF_ENDPOINT')}")
-# # 全局日志配置（仅在首次导入时生效）
-# if not logger.handlers:
-#     handler = logging.StreamHandler()
-#     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-#     handler.setFormatter(formatter)
-#     logger.addHandler(handler)
-#     logger.setLevel(logging.INFO)  # 可根据需要调整为 logging.DEBUG
 
-# app = FastAPI()
+logger = logging.getLogger("fastapi_server")
+logger.info("HF_ENDPOINT=%s", os.environ.get("HF_ENDPOINT"))
+
+# ----------------------------------------------------------------------
+# FastAPI lifespan
+# ----------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # startup
+    logger.info("FastAPI startup: warming up model")
     pipe("你好")  # 模型预热
     yield
-    # shutdown（可选）
+    logger.info("FastAPI shutdown")
 
 app = FastAPI(lifespan=lifespan)
 
+# ----------------------------------------------------------------------
+# Model loading
+# ----------------------------------------------------------------------
 def get_torch_device():
     if torch.cuda.is_available():
         return "cuda"
     elif torch.backends.mps.is_available():
-        return "mps"   # Apple Silicon
+        return "mps"  # Apple Silicon
     else:
         return "cpu"
 
 model_name = "Qwen/Qwen2.5-0.5B-Instruct"
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(
+    model_name,
+    trust_remote_code=True,
+)
+
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
     torch_dtype=torch.float16,
     device_map=get_torch_device(),
-    trust_remote_code=True
+    trust_remote_code=True,
 )
 
 pipe = pipeline(
@@ -62,51 +67,87 @@ pipe = pipeline(
     tokenizer=tokenizer,
     max_new_tokens=80,
     temperature=0.0,
-    do_sample=False
+    do_sample=False,
 )
 
+# ----------------------------------------------------------------------
+# Request schema
+# ----------------------------------------------------------------------
 class ChatReq(BaseModel):
     model: str
-    messages: list
+    messages: List[Dict[str, str]]
 
+# ----------------------------------------------------------------------
+# Core: messages -> prompt
+# ----------------------------------------------------------------------
+def build_chat_prompt(messages: List[Dict[str, str]]) -> str:
+    """
+    将 OpenAI-style messages 编译为单一文本 prompt
+    适配 Qwen Instruct + text-generation pipeline
+    """
+    parts = []
+
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content", "").strip()
+
+        if not content:
+            continue
+
+        if role == "system":
+            parts.append(f"系统指令：{content}")
+        elif role in ("user", "human"):
+            parts.append(f"用户：{content}")
+        elif role in ("assistant", "ai"):
+            parts.append(f"助手：{content}")
+        else:
+            parts.append(content)
+
+    # 明确告诉模型：下面该你说了
+    parts.append("助手：")
+
+    return "\n".join(parts)
+
+# ----------------------------------------------------------------------
+# Chat completions API
+# ----------------------------------------------------------------------
 @app.post("/v1/chat/completions")
 def chat(req: ChatReq):
-    # 记录完整的请求信息
     logger.info("=" * 80)
-    logger.info(f"收到请求时间: {datetime.now().isoformat()}")
-    logger.info(f"请求模型: {req.model}")
+    logger.info("收到请求时间: %s", datetime.now().isoformat())
+    logger.info("请求模型: %s", req.model)
 
-    # 记录完整的messages结构
-    logger.info("完整的messages结构:")
+    logger.info("完整的 messages 结构:")
     for i, msg in enumerate(req.messages):
-        logger.info(f"  [{i}] role={msg['role']}")
-        logger.info(f"      content={msg['content'][:200]}...")  # 只显示前200字符
+        logger.info("  [%d] role=%s", i, msg.get("role"))
+        logger.info("      content=%s...", msg.get("content", "")[:200])
 
-    # 提取最后一个用户消息作为prompt
-    user_message = None
-    for msg in reversed(req.messages):
-        if msg["role"] == "user":
-            user_message = msg["content"]
-            break
+    # === 关键修复点：拼接完整 prompt ===
+    prompt = build_chat_prompt(req.messages)
 
-    if user_message:
-        logger.info(f"最终用户prompt: {user_message}")
+    logger.info("最终拼接给模型的完整 prompt:\n%s", prompt)
+    logger.info("实际发送给模型的 prompt 长度: %d 字符", len(prompt))
 
-    logger.info(
-        "FastAPI Rewrite request received, model=%s, prompt=%s",
-        req.model,
-        req.messages[-1]["content"]
-    )
-    prompt = req.messages[-1]["content"]
-    logger.info(f"实际发送给模型的prompt长度: {len(prompt)} 字符")
-    out = pipe(prompt)[0]["generated_text"]
+    outputs = pipe(prompt)
+    generated_text = outputs[0]["generated_text"]
+
+    # 只返回 assistant 新生成的部分（可按需裁剪）
+    answer = generated_text[len(prompt):].strip()
+
     return {
         "choices": [
-            {"message": {"role": "assistant", "content": out}}
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": answer,
+                }
+            }
         ]
     }
 
+# ----------------------------------------------------------------------
+# Health check
+# ----------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "okk"}
-
+    return {"status": "ok"}
