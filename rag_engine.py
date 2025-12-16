@@ -37,7 +37,7 @@ if not logger.handlers:
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)  # 可根据需要调整为 logging.DEBUG
+    logger.setLevel(logging.DEBUG)  # 可根据需要调整为 logging.DEBUG
 
 logger.propagate = False#防止打印两遍日志
 # 禁用部分 noisy 日志（可选）
@@ -271,23 +271,62 @@ class MedicalRAG:
             # ========= 3. 远程优先 + 本地降级 =========
             class RewriteWithFallback(Runnable):
                 def invoke(self, input, config=None, **kwargs) -> str:
-                    # === 关键：兼容 ChatPromptValue ===
+                    """
+                    Rewrite 查询：
+                    1. 优先调用远端 FastAPI LLM
+                    2. 严格解析 OpenAI ChatCompletion 结构
+                    3. 失败时自动降级本地模型
+                    """
+                    logger.debug(
+                        "RewriteWithFallback input type=%s, input=%s",
+                        type(input),
+                        input
+                    )
+                    # ===== 1. 统一抽取 query（兼容 LangChain）=====
                     if isinstance(input, ChatPromptValue):
-                        # 取最后一条 HumanMessage
                         messages = input.to_messages()
                         human_msgs = [m for m in messages if m.type == "human"]
                         query = human_msgs[-1].content if human_msgs else messages[-1].content
+                        logger.debug(
+                            "Rewrite extracted query from ChatPromptValue: %s",
+                            query
+                        )
                     else:
                         query = str(input)
+                        logger.debug(
+                            "Rewrite extracted query from str input: %s",
+                            query
+                        )
 
+                    # ===== 2. 远端 Rewrite =====
                     try:
                         start = time.time()
-                        result = remote_llm.invoke(query)
-                        logger.info(f"Rewrite remote latency={time.time() - start:.2f}s")
-                        return result.strip().splitlines()[0]
+                        content = remote_llm.invoke(query)
+                        latency = time.time() - start
+
+                        logger.info(
+                            "Rewrite remote success, latency=%.2fs, resp_type=%s, output=%s",
+                            latency,
+                            type(content),
+                            content
+                        )
+
+                        return content.strip()
+
                     except Exception as e:
-                        logger.info(f"Rewrite LLM 降级为本地模型，原因: {e}")
-                        return local_llm.invoke(query)
+                        logger.warning(
+                            "Rewrite LLM fallback to local, reason=%s, query=%s",
+                            e,
+                            query
+                        )
+                        local_out = local_llm.invoke(query)
+
+                        logger.info(
+                            "Rewrite LOCAL result=%s",
+                            local_out
+                        )
+
+                        return local_out
 
             self.rewrite_llm = RewriteWithFallback()
             logger.info("Rewrite LLM 使用策略：FastAPI 远程优先 + 本地 fallback")
@@ -473,21 +512,26 @@ class MedicalRAG:
         ])
 
         query_rewriter_chain = (
-                query_rewrite_prompt
+                query_rewrite_prompt #query_rewrite_prompt.format_prompt(query=rule_rewritten)
                 | self.rewrite_llm
                 | StrOutputParser()
         )
 
         def log_and_rewrite(question_str):
-            logger.debug(f"原始查询: {question_str}")
+            logger.info(f"查询重写流程: 原始 → 规则 → LLM")
+            logger.info("Rewrite input original_q=%s", question_str)
             # 1. 先用规则重写
             rule_rewritten = self._rewrite_query(question_str)
+            logger.info(
+                "Rewrite after rule, rule_rewritten_q=%s",
+                rule_rewritten
+            )
             # 2. 再用 LLM 规范化
             final_rewritten = query_rewriter_chain.invoke({"query": rule_rewritten})
-            logger.info(f"查询重写流程: 原始 → 规则 → LLM")
-            logger.info(f"  原始问题: {question_str}")
-            logger.info(f"  规则重写: {rule_rewritten}")
-            logger.info(f"  LLM重写: {final_rewritten}")
+            logger.info(
+                "Rewrite final result, rewritten_q=%s",
+                final_rewritten
+            )
             return {"rewritten_q": final_rewritten, "original_q": question_str}
 
         input_mapper = RunnableLambda(log_and_rewrite)

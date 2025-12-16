@@ -13,22 +13,26 @@ class FastAPIRewriteLLM(Runnable):
         self.model = model
         self.timeout = timeout
 
-    def invoke(self, input: str, **kwargs) -> str:
+    def invoke(self, input, **kwargs) -> str:
         if isinstance(input, ChatPromptValue):
-            messages = input.to_messages()
-            input = messages[-1].content
+            messages = []
+            for m in input.to_messages():
+                messages.append({
+                    "role": m.type,  # system / human / ai
+                    "content": m.content
+                })
+        else:
+            messages = [{"role": "user", "content": str(input)}]
 
         payload = {
             "model": self.model,
-            "messages": [
-                {"role": "user", "content": input}
-            ]
+            "messages": messages
         }
 
         resp = requests.post(
             self.endpoint,
             json=payload,
-            timeout=(1.0, 10.0)  # (connect_timeout, read_timeout)
+            timeout=(1.0, 10.0)
         )
         resp.raise_for_status()
 
