@@ -1,6 +1,7 @@
 # main.py
 import logging
 import os
+import sys
 
 if os.path.exists("./qdrant_db/qdrant.lock"):
     os.remove("./qdrant_db/qdrant.lock")
@@ -20,7 +21,8 @@ def setup_logging(log_file="logs/medical_rag.log", level=logging.DEBUG):
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
     )
 
-    console_handler = logging.StreamHandler()
+    # 控制台日志 → stderr（关键）
+    console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
 
@@ -28,6 +30,11 @@ def setup_logging(log_file="logs/medical_rag.log", level=logging.DEBUG):
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
 
+
+def safe_input(prompt: str) -> str:
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return input(prompt)
 
 def main():
     logging.info("正在初始化医疗 RAG 系统...")
@@ -38,7 +45,7 @@ def main():
         logging.info("系统就绪！请输入您的医疗问题（输入 'quit' 退出）")
 
         while True:
-            question = input("🩺 您的问题: ").strip()
+            question = safe_input("您的问题: ").strip()
             if question.lower() in ["quit", "exit", "q"]:
                 logging.info("感谢使用医疗辅助系统，再见！")
                 break
