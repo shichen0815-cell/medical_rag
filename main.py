@@ -74,9 +74,9 @@ def run_review_mode(rag):
     """病历检阅模式"""
     logging.info("进入病历检阅模式")
     try:
-        medical_text = load_docs_text("docs")
-        logging.info("病历读取完成，开始 RAG 检阅...")
-        result = rag.review_text(medical_text)
+        medical_text = load_docs_text("docs/medical_record")
+        logging.info("病历读取完成，开始 RAG 检阅...medical_text: %s", medical_text)
+        result = rag.review_record(medical_text)
         logging.info("病历检阅结果：\n%s", result)
     except Exception as e:
         logging.error(f"病历检阅失败: {e}", exc_info=True)

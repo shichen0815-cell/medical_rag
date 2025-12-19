@@ -22,6 +22,10 @@ import time
 from langchain_core.runnables import Runnable
 from langchain_core.messages import BaseMessage
 from langchain_core.prompt_values import ChatPromptValue
+from ollama import OllamaClient
+import json
+import re
+import inspect
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -67,6 +71,8 @@ class MedicalRAG:
         self._auto_convert_pdfs()
         self.collection_name = collection_name
         self._init_models()
+        #
+        self._init_ollama()
         self._init_rewrite_llm()#必须在主模型后，如不设置重写模型可以使用主模型
         # ===== 初始化图检索器 =====
         self.graph_retriever = GraphRetriever() if GRAPH_RETRIEVER_AVAILABLE else None
@@ -119,6 +125,14 @@ class MedicalRAG:
 
         except Exception as e:
             logger.error(f"PDF 自动转换过程出错: {e}", exc_info=True)
+
+    def _init_ollama(self):
+        logger.info("初始化 OllamaClient...")
+        self.ollama = OllamaClient(
+            model="qwen2:7b-instruct-q5_K_M",
+            base_url="http://localhost:11434",
+            timeout=120,
+        )
 
     def _init_models(self):
         logger.info("加载嵌入模型 (BAAI/bge-m3)...")
@@ -333,9 +347,11 @@ class MedicalRAG:
 
     def _load_and_index_documents(self):
         # 假设 self.collection_name = "medical_db"
-        import inspect
-        print("Qdrant class location:", inspect.getfile(Qdrant))
-        print("Qdrant module:", Qdrant.__module__)
+        logger.debug(
+            "Qdrant class location=%s, module=%s",
+            inspect.getfile(Qdrant),
+            Qdrant.__module__,
+        )
         # 1. 检查数据文件
         logger.info("加载医学文档...")
         documents = []
@@ -565,6 +581,192 @@ class MedicalRAG:
             return f"{answer}\n\n（资料来源：{sources}）"
 
         self.rag_chain = base_chain | RunnableLambda(finalize_output)
+
+    def _build_review_prompt(self, medical_text: str) -> str:
+            return f"""
+        请根据以下病历文本，严格按照给定的 JSON 结构进行信息抽取。
+        【JSON 结构】
+        {{
+          "patient_info": {{
+            "age": "string | null",       // 提取原文提到的年龄（带单位，如'24个月'或'45岁'）
+            "gender": "string | null",
+            "vital_signs_extracted": {{   // 仅提取原文明确记录的体征数据
+                "temperature": "string | null",
+                "blood_pressure": "string | null",
+                "heart_rate": "string | null"
+            }}
+          }},
+          "medical_history": {{
+            "chief_complaint": "string | null",  // 主诉
+            "history_present_illness": "string | null", // 现病史
+            "past_medical_history": "string | null",    // 既往史/过敏史
+            "symptoms_list": ["string"]   // 原文提到的具体症状列表（原子化抽取）
+          }},
+          "diagnosis_info": {{
+            "clinical_diagnosis": ["string"], // 医生下达的诊断结果
+            "icd_code_candidate": "string | null" // 若原文提到了ICD编码则提取，否则null
+          }},
+          "examinations": [ // 检查检验
+            {{
+              "name": "string", // 项目名称，如"血常规"、"CT"
+              "findings": "string", // 检查所见/结果描述
+              "is_abnormal": boolean // 仅根据原文描述判断（原文说异常即为true，否则false）
+            }}
+          ],
+          "treatment_plan": {{ // 【重点：处置意见】
+            "medications": [ // 处方/用药信息
+              {{
+                "name": "string",
+                "specification": "string | null", // 规格/剂量
+                "usage": "string | null" // 用法用量
+              }}
+            ],
+            "procedures": ["string"], // 治疗操作（如：清创缝合、手术、吸氧）
+            "disposition": "string | null", // 处置去向（如：离院、留观、收住院、转院）
+            "doctor_advice": "string | null", // 医嘱/健康指导（如：低脂饮食、卧床休息、3天后复查）
+            "follow_up_plan": "string | null" // 复诊计划
+          }}
+        }}
+    
+        【待处理病历文本】
+        {medical_text}
+        """.strip()
+
+    def _invoke_llm(self, prompt: str) -> str:
+        """
+        调用 Ollama /api/chat，使用 system + user messages。
+        prompt: 这里是最终提示词字符串（包含病历文本等）
+        """
+        logger.debug("调用 LLM（通过 OllamaClient /api/chat）")
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是一个专业的【医学病历结构化专员】"
+                    "你的唯一任务是：从非结构化的病历文本中精准提取信息，填入指定的 JSON 字段（非诊断）。"
+                    "【强制要求】 "
+                    "- 只输出 JSON，不要输出任何解释性文字 - 不确定的信息请使用 null "
+                    "- 不允许编造病历中未出现的信息 "
+                    "- JSON 必须是合法格式，可被直接解析"
+                    "- 不要对病情进行风险评估，不要给出你的医学建议，只提取原文记录的内容 "
+                )
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+
+        return self.ollama.generate(messages)
+
+    def _extract_json_block(self, text: str) -> str | None:
+        match = re.search(r"\{[\s\S]*\}", text)
+        return match.group(0) if match else None
+
+    def _repair_json_with_llm(self, bad_json: str, medical_text: str) -> str:
+        repair_prompt = f"""
+    你是一个 JSON 修复助手。
+    以下内容是一个【不合法的 JSON】，来源于医学病历检阅任务。
+
+    【要求】
+    - 只输出修复后的 JSON
+    - 不要新增任何病历中不存在的信息
+    - 保持原有 JSON 结构
+    - 无法确定的字段设为 null
+
+    【原始病历文本】
+    {medical_text}
+
+    【损坏的 JSON】
+    {bad_json}
+    """.strip()
+
+        logger.info("尝试使用 LLM 修复 JSON")
+        return self._safe_llm_call(repair_prompt, retry=1)
+
+    def _parse_or_repair_json(self, text: str, medical_text: str) -> dict:
+        """
+        解析 JSON：
+        1. 直接解析
+        2. 提取 JSON 子串
+        3. LLM 修复
+        4. 最终降级
+        """
+
+        # 直接 parse
+        try:
+            return json.loads(text)
+        except Exception:
+            logger.warning("JSON 直接解析失败，尝试修复")
+
+        # 尝试提取 {...}
+        extracted = self._extract_json_block(text)
+        if extracted:
+            try:
+                return json.loads(extracted)
+            except Exception:
+                logger.warning("提取 JSON 后仍解析失败")
+
+        # 让 LLM 修复 JSON
+        repaired = self._repair_json_with_llm(text, medical_text)
+        try:
+            return json.loads(repaired)
+        except Exception:
+            logger.error("LLM 修复 JSON 仍失败，进入降级")
+
+        # 最终降级（返回最小安全结构）
+        return self._fallback_empty_review()
+
+    def _fallback_empty_review(self) -> dict:
+        logger.error("进入病历检阅最终降级路径")
+        return {
+            "patient_summary": {
+                "age": None,
+                "gender": None,
+                "chief_complaint": None,
+                "history": None
+            },
+            "key_findings": [],
+            "risk_flags": [],
+            "medications": [],
+            "tests": [],
+            "review_conclusion": "病历信息不足，无法完成结构化检阅。"
+        }
+
+    def _safe_llm_call(self, prompt: str, retry: int = 2) -> str:
+        last_error = None
+
+        for attempt in range(1, retry + 1):
+            try:
+                logger.info("LLM 调用尝试 #%d", attempt)
+                output = self._invoke_llm(prompt)
+                logger.debug("LLM 原始输出：%s", output)
+                return output
+            except Exception as e:
+                last_error = e
+                logger.warning("LLM 调用失败 #%d: %s", attempt, e)
+
+        raise RuntimeError("LLM 多次调用失败") from last_error
+
+    def review_record(self, medical_text: str) -> dict:
+        """
+        病历检阅主入口：
+        - 返回 dict（已解析 JSON）
+        - 内部完成 retry / repair / fallback
+        """
+        logger.info("开始病历检阅（review_record）")
+
+        prompt = self._build_review_prompt(medical_text)
+
+        # 第一次尝试
+        raw_output = self._safe_llm_call(prompt)
+
+        # JSON 解析 + 自动修复
+        parsed = self._parse_or_repair_json(raw_output, medical_text)
+
+        logger.info("病历检阅完成（JSON 已结构化）%s", parsed)
+        return parsed
 
     def ask(self, question: str) -> str:
         return self.rag_chain.invoke(question)
