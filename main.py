@@ -1,7 +1,9 @@
 # main.py
+import sys
+from io_guard import hijack_stdout
+hijack_stdout()
 import logging
 import os
-import sys
 from pathlib import Path
 
 if os.path.exists("./qdrant_db/qdrant.lock"):
