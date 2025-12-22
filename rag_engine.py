@@ -454,13 +454,28 @@ class MedicalRAG:
             if hasattr(self, 'vector_store'):
                 try:
                     # 召回 Top-10，给 Reranker 足够的选择空间
-                    vector_docs = self.vector_store.similarity_search(query, k=10)
-                    for doc in vector_docs:
-                        doc.metadata["source_type"] = "VectorDB"
-                        doc.metadata["confidence"] = "medium"
+                    # vector_docs = self.vector_store.similarity_search(query, k=10)
+                    # for doc in vector_docs:
+                    #     doc.metadata["source_type"] = "VectorDB"
+                    #     doc.metadata["confidence"] = "medium"
+                    # 使用 similarity_search_with_score 而不是 similarity_search
+                    results_with_score = self.vector_store.similarity_search_with_score(query, k=5)
 
-                    all_candidates.extend(vector_docs)
-                    logger.info(f"Path B (Vector) 召回 {len(vector_docs)} 条非结构化片段")
+                    valid_docs = []
+                    THRESHOLD = 0.65  # 需要根据你的 Embedding 模型测试确定，BGE-M3 通常建议 0.5~0.6
+
+                    for doc, score in results_with_score:
+                        logger.debug(f"检索得分: {score} | 内容: {doc.page_content[:20]}...")
+                        if score >= THRESHOLD:
+                            valid_docs.append(doc)
+                        else:
+                            logger.warning(f"丢弃低分文档 (Score: {score}): {doc.page_content[:20]}...")
+
+                    if not valid_docs:
+                        logger.info("未检索到符合阈值的文档。")
+
+                    all_candidates.extend(valid_docs)
+                    logger.info(f"Path B (Vector) 召回 {len(valid_docs)} 条非结构化片段")
                 except Exception as e:
                     logger.error(f"向量检索异常: {e}")
 
@@ -498,38 +513,38 @@ class MedicalRAG:
                 logger.error(f"Rerank 失败，降级为原始顺序: {e}")
                 return candidates_list[:3]
 
-    def _hybrid_retrieve2(self, query: str) -> List:
-        """混合检索：向量 + 图 → 合并 → 统一 rerank"""
-        # 1. 向量检索（原始相似性）
-        logger.info(f"混合检索接收到查询： {query}")
-        vector_docs = self.vector_store.similarity_search(query, k=5)
-
-        # 2. 图检索（如有）
-        graph_docs = []
-        if self.graph_retriever:
-            try:
-                graph_docs = self.graph_retriever.retrieve(query)
-                for doc in graph_docs:
-                    logger.info(f"  图检索 : {doc.page_content}")
-            except Exception as e:
-                logger.error(f"图检索异常（已跳过）: {e}")
-
-        # 3. 合并 & 去重
-        all_docs = vector_docs + graph_docs
-        seen = set()
-        unique_docs = []
-        for doc in all_docs:
-            key = doc.page_content.strip()
-            if key and key not in seen:
-                seen.add(key)
-                unique_docs.append(doc)
-
-        if not unique_docs:
-            return []
-        # 4. 统一 rerank（使用你原有的 reranker）
-        compressor = CrossEncoderReranker(model=self.reranker, top_n=3)
-        reranked_docs = compressor.compress_documents(documents=unique_docs, query=query)
-        return reranked_docs
+    # def _hybrid_retrieve2(self, query: str) -> List:
+    #     """混合检索：向量 + 图 → 合并 → 统一 rerank"""
+    #     # 1. 向量检索（原始相似性）
+    #     logger.info(f"混合检索接收到查询： {query}")
+    #     vector_docs = self.vector_store.similarity_search(query, k=5)
+    #
+    #     # 2. 图检索（如有）
+    #     graph_docs = []
+    #     if self.graph_retriever:
+    #         try:
+    #             graph_docs = self.graph_retriever.retrieve(query)
+    #             for doc in graph_docs:
+    #                 logger.info(f"  图检索 : {doc.page_content}")
+    #         except Exception as e:
+    #             logger.error(f"图检索异常（已跳过）: {e}")
+    #
+    #     # 3. 合并 & 去重
+    #     all_docs = vector_docs + graph_docs
+    #     seen = set()
+    #     unique_docs = []
+    #     for doc in all_docs:
+    #         key = doc.page_content.strip()
+    #         if key and key not in seen:
+    #             seen.add(key)
+    #             unique_docs.append(doc)
+    #
+    #     if not unique_docs:
+    #         return []
+    #     # 4. 统一 rerank（使用你原有的 reranker）
+    #     compressor = CrossEncoderReranker(model=self.reranker, top_n=3)
+    #     reranked_docs = compressor.compress_documents(documents=unique_docs, query=query)
+    #     return reranked_docs
 
     def _rewrite_query(self, query: str) -> str:
         rewrite_rules = {
@@ -965,7 +980,7 @@ class MedicalRAG:
             # 直接调用 ollama，绕过原有逻辑
             response = self.ollama.generate(messages)
 
-            logger.info("self._invoke_llm  返回%s ", response)
+            logger.debug("self._invoke_llm  返回%s ", response)
             # 清洗结果
             match = re.search(r"\[[\s\S]*\]", response)
             if match:
@@ -1030,7 +1045,7 @@ class MedicalRAG:
 
         # --- 步骤 3: RAG 辅助审核 ---
         # 针对每个原子查询进行 RAG 检索和风险判断
-        logger.info(f"生成的原子查询列表: {atomic_queries}")
+        logger.debug(f"生成的原子查询列表: {atomic_queries}")
         audit_results = self._execute_batch_audit(atomic_queries, extracted_data)
 
         # --- 步骤 4: 结果注入 ---
