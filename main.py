@@ -5,33 +5,99 @@ hijack_stdout()
 import logging
 import os
 from pathlib import Path
+from utils.json_logger import to_json_str
 
 if os.path.exists("./qdrant_db/qdrant.lock"):
     os.remove("./qdrant_db/qdrant.lock")
 
 
+# def setup_logging(log_file="logs/medical_rag.log", level=logging.DEBUG):
+#     """统一日志配置：同时输出到控制台和文件"""
+#     os.makedirs(os.path.dirname(log_file), exist_ok=True)
+#
+#     # ★ 关键：获取 root logger，但只配置一次
+#     root_logger = logging.getLogger()
+#
+#     # 如果已经配置过处理器，直接返回
+#     if root_logger.handlers:
+#         root_logger.info("日志系统已初始化，跳过重复配置")
+#         return
+#
+#     root_logger.setLevel(level)
+#     # ★ 关键：禁用传播，避免第三方库的日志干扰
+#     root_logger.propagate = False
+#
+#     root_logger = logging.getLogger()
+#     root_logger.setLevel(level)
+#
+#     # 清理可能残留的处理器（安全措施）
+#     for h in list(root_logger.handlers):
+#         root_logger.removeHandler(h)
+#
+#     formatter = logging.Formatter(
+#         "%(asctime)s - %(name)s - %(lineno)s - %(levelname)s - %(message)s"
+#     )
+#
+#     console_handler = logging.StreamHandler(sys.stderr)
+#     console_handler.setFormatter(formatter)
+#     root_logger.addHandler(console_handler)
+#
+#     file_handler = logging.FileHandler(log_file, encoding="utf-8")
+#     file_handler.setFormatter(formatter)
+#     root_logger.addHandler(file_handler)
+#     # 特别处理一些可能产生重复日志的库
+#     logging.getLogger("urllib3").setLevel(logging.WARNING)
+#     logging.getLogger("requests").setLevel(logging.WARNING)
+#     logging.getLogger("httpx").setLevel(logging.WARNING)
 def setup_logging(log_file="logs/medical_rag.log", level=logging.DEBUG):
     """统一日志配置：同时输出到控制台和文件"""
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
 
+    # ★ 关键：获取 root logger，只配置一次
     root_logger = logging.getLogger()
-    root_logger.setLevel(level)
 
-    if root_logger.handlers:
+    # 如果已经有处理器，并且不是我们刚添加的，则清理后重新配置
+    # 这里使用更严格的判断
+    if hasattr(root_logger, '_medical_rag_configured') and root_logger._medical_rag_configured:
         return
 
+    # 清除所有现有处理器
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # 重置日志级别
+    root_logger.setLevel(level)
+
+    # 禁用传播（重要！）
+    root_logger.propagate = False
+
+    # 创建格式化器
     formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        "%(asctime)s - %(name)s - %(lineno)s - %(levelname)s - %(message)s"
     )
 
+    # 控制台处理器（只添加到 stderr）
     console_handler = logging.StreamHandler(sys.stderr)
     console_handler.setFormatter(formatter)
+    console_handler.setLevel(level)
     root_logger.addHandler(console_handler)
 
+    # 文件处理器
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(formatter)
+    file_handler.setLevel(level)
     root_logger.addHandler(file_handler)
 
+    # ★ 标记已经配置过
+    root_logger._medical_rag_configured = True
+
+    # 特别处理一些可能产生重复日志的库
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    # 调试信息
+    root_logger.debug(f"日志系统已初始化，处理器数量: {len(root_logger.handlers)}")
 
 def safe_input(prompt: str) -> str:
     sys.stdout.write("\n")
@@ -79,7 +145,7 @@ def run_review_mode(rag):
         medical_text = load_docs_text("docs/medical_record")
         logging.info("病历读取完成，开始 RAG 检阅...medical_text: %s", medical_text)
         result = rag.review_record(medical_text)
-        logging.info("病历检阅结果：\n%s", result)
+        logging.info("病历检阅结果：\n%s", to_json_str(result))
     except Exception as e:
         logging.error(f"病历检阅失败: {e}", exc_info=True)
 
@@ -99,9 +165,22 @@ def run_qa_mode(rag):
 
         try:
             answer = rag.ask(question)
-            logging.info("回答:\n%s", answer)
+            logging.info("回答:\n%s", to_json_str(answer))
         except Exception as e:
             logging.error(f"回答生成出错: {e}", exc_info=True)
+
+
+def show_menu():
+    """显示主菜单并获取用户输入"""
+    print("\n" + "=" * 40)
+    print("医疗 RAG 系统")
+    print("=" * 40)
+    print("1 - 病历检阅模式")
+    print("2 - 医学问答模式")
+    print("exit - 退出系统")
+    print("=" * 40)
+
+    return input("请输入指令: ").strip().lower()
 
 
 def main():
@@ -119,14 +198,29 @@ def main():
 
     logging.info("系统初始化完成，进入主循环")
 
+    # 只在程序开始时显示一次完整菜单
+    print("\n" + "=" * 40)
+    print("医疗 RAG 系统")
+    print("=" * 40)
+    print("1 - 病历检阅模式")
+    print("2 - 医学问答模式")
+    print("exit - 退出系统")
+    print("=" * 40)
+
     while True:
         try:
-            print("\n请选择运行模式：")
-            print("1 - 病历检阅模式")
-            print("2 - 医学问答模式")
-            print("exit - 退出系统")
+            cmd = input("\n请输入指令 (输入 m 显示菜单): ").strip().lower()
 
-            cmd = input("请输入指令: ").strip().lower()
+            # 如果用户输入 m，重新显示完整菜单
+            if cmd == "m":
+                print("\n" + "=" * 40)
+                print("医疗 RAG 系统")
+                print("=" * 40)
+                print("1 - 病历检阅模式")
+                print("2 - 医学问答模式")
+                print("exit - 退出系统")
+                print("=" * 40)
+                continue
 
             if cmd in ("exit", "quit", "q"):
                 logging.info("收到退出指令，系统即将退出")
@@ -137,7 +231,8 @@ def main():
             elif cmd == "2":
                 run_qa_mode(rag)
             else:
-                print("无效指令，请重新输入")
+                print("无效指令，请输入 1, 2, exit 或 m (显示菜单)")
+                continue
 
         except KeyboardInterrupt:
             logging.info("检测到 Ctrl+C，中断当前操作，返回主菜单")
@@ -145,8 +240,12 @@ def main():
         except Exception as e:
             logging.error(f"运行过程中发生异常: {e}", exc_info=True)
             print("本次执行失败，已返回主菜单")
+            continue
 
     logging.info("医疗 RAG 系统已安全退出")
+
+
+
 
 
 if __name__ == "__main__":
