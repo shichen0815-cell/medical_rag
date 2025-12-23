@@ -13,10 +13,8 @@ if os.path.exists("./qdrant_db/qdrant.lock"):
 def setup_logging(log_file="logs/medical_rag.log", level=logging.DEBUG):
     """统一日志配置：同时输出到控制台和文件"""
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
-
     # ★ 关键：获取 root logger，只配置一次
     root_logger = logging.getLogger()
-
     # 如果已经有处理器，并且不是我们刚添加的，则清理后重新配置
     # 这里使用更严格的判断
     if hasattr(root_logger, '_medical_rag_configured') and root_logger._medical_rag_configured:
@@ -31,7 +29,6 @@ def setup_logging(log_file="logs/medical_rag.log", level=logging.DEBUG):
 
     # 禁用传播（重要！）
     root_logger.propagate = False
-
     # 创建格式化器
     formatter = logging.Formatter(
         "%(asctime)s - %(name)s - %(lineno)s - %(levelname)s - %(message)s"
@@ -42,21 +39,17 @@ def setup_logging(log_file="logs/medical_rag.log", level=logging.DEBUG):
     console_handler.setFormatter(formatter)
     console_handler.setLevel(level)
     root_logger.addHandler(console_handler)
-
     # 文件处理器
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setFormatter(formatter)
     file_handler.setLevel(level)
     root_logger.addHandler(file_handler)
-
     # ★ 标记已经配置过
     root_logger._medical_rag_configured = True
-
     # 特别处理一些可能产生重复日志的库
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("requests").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
-
     # 调试信息
     root_logger.debug(f"日志系统已初始化，处理器数量: {len(root_logger.handlers)}")
 
