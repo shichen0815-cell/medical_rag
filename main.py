@@ -10,45 +10,6 @@ from utils.json_logger import to_json_str
 if os.path.exists("./qdrant_db/qdrant.lock"):
     os.remove("./qdrant_db/qdrant.lock")
 
-
-# def setup_logging(log_file="logs/medical_rag.log", level=logging.DEBUG):
-#     """统一日志配置：同时输出到控制台和文件"""
-#     os.makedirs(os.path.dirname(log_file), exist_ok=True)
-#
-#     # ★ 关键：获取 root logger，但只配置一次
-#     root_logger = logging.getLogger()
-#
-#     # 如果已经配置过处理器，直接返回
-#     if root_logger.handlers:
-#         root_logger.info("日志系统已初始化，跳过重复配置")
-#         return
-#
-#     root_logger.setLevel(level)
-#     # ★ 关键：禁用传播，避免第三方库的日志干扰
-#     root_logger.propagate = False
-#
-#     root_logger = logging.getLogger()
-#     root_logger.setLevel(level)
-#
-#     # 清理可能残留的处理器（安全措施）
-#     for h in list(root_logger.handlers):
-#         root_logger.removeHandler(h)
-#
-#     formatter = logging.Formatter(
-#         "%(asctime)s - %(name)s - %(lineno)s - %(levelname)s - %(message)s"
-#     )
-#
-#     console_handler = logging.StreamHandler(sys.stderr)
-#     console_handler.setFormatter(formatter)
-#     root_logger.addHandler(console_handler)
-#
-#     file_handler = logging.FileHandler(log_file, encoding="utf-8")
-#     file_handler.setFormatter(formatter)
-#     root_logger.addHandler(file_handler)
-#     # 特别处理一些可能产生重复日志的库
-#     logging.getLogger("urllib3").setLevel(logging.WARNING)
-#     logging.getLogger("requests").setLevel(logging.WARNING)
-#     logging.getLogger("httpx").setLevel(logging.WARNING)
 def setup_logging(log_file="logs/medical_rag.log", level=logging.DEBUG):
     """统一日志配置：同时输出到控制台和文件"""
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
@@ -243,10 +204,6 @@ def main():
             continue
 
     logging.info("医疗 RAG 系统已安全退出")
-
-
-
-
 
 if __name__ == "__main__":
     setup_logging()
