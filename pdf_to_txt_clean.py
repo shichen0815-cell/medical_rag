@@ -105,6 +105,6 @@ if __name__ == "__main__":
     # convert_pdf_to_txt("downloads/diabetes_guide_2022.pdf")
 
     # 方式2：批量转换整个目录
-    batch_convert_pdf_to_txt(pdf_dir="downloads/", output_dir="data/")
+    batch_convert_pdf_to_txt(pdf_dir="data/", output_dir="data/")
 
     print("\n🎉 所有 PDF 转换完成！请检查 data/ 目录。")
