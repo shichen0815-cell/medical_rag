@@ -27,6 +27,7 @@ from ollama import OllamaClient
 import json
 import re
 import inspect
+from text_splitter_medical import UnifiedMedicalTextSplitter
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
@@ -381,13 +382,20 @@ class MedicalRAG:
             raise ValueError("未找到任何医学文档！请检查 data/ 目录并确保存在 .txt 文件。")
 
         # 2. 分块
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=400,
-            chunk_overlap=50,
-            separators=["\n\n", "\n", "。", "；", " "]
-        )
-        chunks = text_splitter.split_documents(documents)
+        splitter = UnifiedMedicalTextSplitter(chunk_size=600, chunk_overlap=100)
+        chunks = splitter.split_documents(documents)
         logger.info(f"成功加载 {len(documents)} 个文档，共生成 {len(chunks)} 个文本块，正在构建向量库...")
+        # 优化后的打印逻辑
+        for i, doc in enumerate(chunks):
+            # 1. 为了防止日志太长，只截取前 100 个字符
+            # 2. 去掉换行符，保持日志整洁
+            preview_content = doc.page_content[:100].replace('\n', ' ')
+
+            # 3. 获取元数据（方便检查 section 提取是否正确）
+            source = doc.metadata.get("section", "未知章节")
+
+            # 4. 使用 f-string 正确打印
+            logger.debug(f"Chunk [{i}] | 章节: {source} | 内容: {preview_content}...")
 
         # 3. 构建/写入 Qdrant 向量库
         try:
