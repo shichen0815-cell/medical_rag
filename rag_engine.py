@@ -1,6 +1,7 @@
 import logging
 import json
 import re
+import ast
 from typing import List, Optional
 
 from langchain_core.documents import Document
@@ -231,47 +232,60 @@ class MedicalRAG:
         [完全复原] 构建病历检阅 Prompt，包含所有原有字段。
         """
         return f"""
-        请根据以下病历文本，严格按照给定的 JSON 结构进行信息抽取。
-        【JSON 结构】
+        你是一名资深的病历结构化专家。请阅读下方的【待处理病历文本】，提取关键信息填入指定的 JSON 格式。
+
+        【提取规则】
+        1. **完整性**：如果处方中有多种药物，**必须全部提取**，存入 medications 列表，严禁遗漏。
+        2. **准确性**：数值和单位必须与原文一致。
+        3. **格式**：只输出标准的 JSON 字符串，不要包含 Markdown 标记（如 ```json），不要包含注释。
+        4. **空值处理**：未提及的字段填 null。
+        5. **兼容性**：必须输出标准 JSON (null, true, false)，严禁使用 Python 风格 (None, True, False)。
+        【目标 JSON 结构定义】
+        - patient_info: 患者基本信息 (age, gender, vital_signs_extracted)
+        - medical_history: 病史 (chief_complaint, symptoms_list=[症状1, 症状2...])
+        - diagnosis_info: 诊断 (clinical_diagnosis=[诊断1, 诊断2...])
+        - treatment_plan: 治疗方案 (medications=[{{name, specification, usage}}])
+        
+        【输出模板】
         {{
           "patient_info": {{
-            "age": "string | null",       // 提取原文提到的年龄（带单位，如'24个月'或'45岁'）
+            "age": "string | null",
             "gender": "string | null",
-            "vital_signs_extracted": {{   // 仅提取原文明确记录的体征数据
+            "vital_signs_extracted": {{
                 "temperature": "string | null",
                 "blood_pressure": "string | null",
                 "heart_rate": "string | null"
             }}
           }},
           "medical_history": {{
-            "chief_complaint": "string | null",  // 主诉
-            "history_present_illness": "string | null", // 现病史
-            "past_medical_history": "string | null",    // 既往史/过敏史
-            "symptoms_list": ["string"]   // 原文提到的具体症状列表（原子化抽取）
+            "chief_complaint": "string | null",
+            "history_present_illness": "string | null",
+            "past_medical_history": "string | null",
+            "symptoms_list": ["string"]
           }},
           "diagnosis_info": {{
-            "clinical_diagnosis": ["string"], // 医生下达的诊断结果
-            "icd_code_candidate": "string | null" // 若原文提到了ICD编码则提取，否则null
+            "clinical_diagnosis": ["string"],
+            "icd_code_candidate": "string | null" 
           }},
-          "examinations": [ // 检查检验
+          "examinations": [
             {{
-              "name": "string", // 项目名称，如"血常规"、"CT"
-              "findings": "string", // 检查所见/结果描述
-              "is_abnormal": boolean // 仅根据原文描述判断（原文说异常即为true，否则false）
+              "name": "string",
+              "findings": "string",
+              "is_abnormal": boolean
             }}
           ],
-          "treatment_plan": {{ // 【重点：处置意见】
-            "medications": [ // 处方/用药信息
+          "treatment_plan": {{ 
+            "medications": [
               {{
                 "name": "string",
-                "specification": "string | null", // 规格/剂量
-                "usage": "string | null" // 用法用量
+                "specification": "string | null",
+                "usage": "string | null" 
               }}
             ],
-            "procedures": ["string"], // 治疗操作（如：清创缝合、手术、吸氧）
-            "disposition": "string | null", // 处置去向（如：离院、留观、收住院、转院）
-            "doctor_advice": "string | null", // 医嘱/健康指导（如：低脂饮食、卧床休息、3天后复查）
-            "follow_up_plan": "string | null" // 复诊计划
+            "procedures": ["string"],
+            "disposition": "string | null",
+            "doctor_advice": "string | null",
+            "follow_up_plan": "string | null"
           }}
         }}
 
@@ -285,13 +299,15 @@ class MedicalRAG:
             {
                 "role": "system",
                 "content": (
-                    "你是一个专业的【医学病历结构化专员】"
+                    "你是一个专业精准的【医学病历结构化专员】"
                     "你的唯一任务是：从非结构化的病历文本中精准提取信息，填入指定的 JSON 字段（非诊断）。"
                     "【强制要求】 "
-                    "- 只输出 JSON，不要输出任何解释性文字 - 不确定的信息请使用 null "
+                    "- 只输出 JSON格式，不要输出任何解释性文字或注释 - 不确定的信息请使用 null "
                     "- 不允许编造病历中未出现的信息 "
                     "- JSON 必须是合法格式，可被直接解析"
                     "- 不要对病情进行风险评估，不要给出你的医学建议，只提取原文记录的内容 "
+                    "- 当病历中包含多个药物时，必须**全部列出**，绝不能只提取第一个"
+                    "- 如果没有相关信息，请保留字段并赋值为 null。"
                 )
             },
             {"role": "user", "content": prompt}
@@ -340,23 +356,117 @@ class MedicalRAG:
         match = re.search(r"\{[\s\S]*\}", text)
         return match.group(0) if match else None
 
+    # def _parse_or_repair_json(self, text: str, medical_text: str) -> dict:
+    #     """
+    #             解析 JSON，具备极强的容错能力：
+    #             1. 去除 Markdown
+    #             2. 尝试标准 JSON 解析 (json.loads)
+    #             3. 尝试 Python 字面量解析 (ast.literal_eval) -> 解决 None/True/False/单引号问题
+    #             4. 尝试正则修正 (None->null)
+    #             5. LLM 修复
+    #             """
+    #     # --- 预处理：去除 Markdown 标记 ---
+    #     cleaned_text = text.strip()
+    #     # 去除 ```json ... ``` 或 ``` ... ```
+    #     if cleaned_text.startswith("```"):
+    #         # 找到第一个换行符
+    #         first_newline = cleaned_text.find("\n")
+    #         if first_newline != -1:
+    #             cleaned_text = cleaned_text[first_newline + 1:]
+    #         if cleaned_text.endswith("```"):
+    #             cleaned_text = cleaned_text[:-3]
+    #     cleaned_text = cleaned_text.strip()
+    #
+    #     try:
+    #         return json.loads(cleaned_text)
+    #     except Exception:
+    #         logger.warning("JSON 直接解析失败，尝试修复")
+    #         pass
+    #     extracted = self._extract_json_block(text)
+    #     if extracted:
+    #         try:
+    #             return json.loads(extracted)
+    #         except:
+    #             pass
+    #
+    #     repaired = self._repair_json_with_llm(text, medical_text)
+    #     try:
+    #         return json.loads(repaired)
+    #     except:
+    #         return self._fallback_empty_review()
     def _parse_or_repair_json(self, text: str, medical_text: str) -> dict:
+        """
+        解析 JSON，具备极强的容错能力：
+        1. 去除 Markdown
+        2. 尝试标准 JSON 解析 (json.loads)
+        3. 尝试 Python 字面量解析 (ast.literal_eval) -> 解决 None/True/False/单引号问题
+        4. 尝试正则修正 (None->null)
+        5. LLM 修复
+        """
+        # --- 预处理：去除 Markdown 标记 ---
+        cleaned_text = text.strip()
+        # 去除 ```json ... ``` 或 ``` ... ```
+        if cleaned_text.startswith("```"):
+            # 找到第一个换行符
+            first_newline = cleaned_text.find("\n")
+            if first_newline != -1:
+                cleaned_text = cleaned_text[first_newline + 1:]
+            if cleaned_text.endswith("```"):
+                cleaned_text = cleaned_text[:-3]
+        cleaned_text = cleaned_text.strip()
+
+        # --- 策略 1: 标准 JSON 解析 ---
         try:
-            return json.loads(text)
+            return json.loads(cleaned_text)
         except Exception:
-            logger.warning("JSON 直接解析失败，尝试修复")
+            pass
 
-        extracted = self._extract_json_block(text)
-        if extracted:
+            # --- 策略 2: Python 语法解析 (关键修复) ---
+        # 模型经常输出 Python dict (None, True, False, 'string') 而不是 JSON
+        try:
+            # ast.literal_eval 能安全解析 Python 风格的字典字符串
+            return ast.literal_eval(cleaned_text)
+        except Exception:
+            pass
+
+        # --- 策略 3: 提取 JSON 块并重试上述步骤 ---
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            block = match.group(0)
             try:
-                return json.loads(extracted)
+                return json.loads(block)
             except:
-                pass
+                try:
+                    return ast.literal_eval(block)
+                except:
+                    pass
 
+        # --- 策略 4: 暴力正则替换 (最后的挣扎) ---
+        # 如果 ast 失败了（可能是因为不合法的语法），尝试手动替换关键字
+        try:
+            # 替换 Python 关键字为 JSON 关键字
+            # 使用 \b 确保是单词边界，避免替换掉单词内部的字符
+            fixed_text = cleaned_text
+            fixed_text = re.sub(r'\bNone\b', 'null', fixed_text)
+            fixed_text = re.sub(r'\bTrue\b', 'true', fixed_text)
+            fixed_text = re.sub(r'\bFalse\b', 'false', fixed_text)
+            # 尝试将单引号替换为双引号 (风险较大，仅作尝试)
+            # fixed_text = fixed_text.replace("'", '"')
+            return json.loads(fixed_text)
+        except Exception:
+            pass
+
+        # --- 策略 5: LLM 修复 ---
+        logger.warning(f"JSON/AST 解析均失败，尝试 LLM 修复。片段: {cleaned_text[:50]}...")
         repaired = self._repair_json_with_llm(text, medical_text)
         try:
-            return json.loads(repaired)
-        except:
+            # 修复后的结果也可能包含 Python 语法，所以再次尝试双重解析
+            try:
+                return json.loads(repaired)
+            except:
+                return ast.literal_eval(repaired)
+        except Exception as e:
+            logger.error(f"LLM 修复后仍无法解析: {e}")
             return self._fallback_empty_review()
 
     def _decompose_case_to_atomic_queries(self, case_json: dict) -> List[str]:
@@ -569,7 +679,11 @@ class MedicalRAG:
 
         # 1. 结构化抽取
         prompt = self._build_review_prompt(medical_text)
+        logger.debug("病历结构化抽取（JSON 已结构化）")
+
         raw_output = self._safe_llm_call(prompt)
+        logger.debug("病历结构化、json化完成")
+
         extracted_data = self._parse_or_repair_json(raw_output, medical_text)
 
         logger.info("病历检阅完成（JSON 已结构化）%s", extracted_data)

@@ -1,6 +1,6 @@
-# demo_app.py
 import streamlit as st
 import time
+import json
 import os
 from rag_engine import MedicalRAG
 
@@ -17,6 +17,8 @@ st.markdown("""
     .reportview-container { background: #f0f2f6 }
     .main-header { font-size: 24px; font-weight: bold; color: #2c3e50; }
     .param-box { border: 1px solid #ddd; padding: 10px; border-radius: 5px; background: #eef; }
+    /* 调整侧边栏间距 */
+    [data-testid="stSidebar"] { padding-top: 2rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -34,12 +36,56 @@ def load_engine():
 with st.spinner("正在启动医疗核心引擎..."):
     engine = load_engine()
 
-# ================= 2. 侧边栏：动态配置与数据管理 =================
+# ================= 2. 侧边栏：控制台 =================
 with st.sidebar:
     st.image("https://img.icons8.com/color/96/000000/doctor-male--v1.png", width=60)
     st.title("控制台")
 
-    # --- 模块 A: 参数调优 ---
+    # ------------------------------------------------
+    # 模块 A: 病历场景选择 (恢复的功能)
+    # ------------------------------------------------
+    st.markdown("### 📂 场景选择")
+
+    # 读取 demo_cases.json
+    cases = []
+    try:
+        if os.path.exists("demo_cases.json"):
+            with open("demo_cases.json", "r", encoding="utf-8") as f:
+                cases = json.load(f)
+        else:
+            st.warning("未找到 demo_cases.json")
+    except Exception as e:
+        st.error(f"加载病历库失败: {e}")
+
+    # 提取选项
+    case_names = [c["title"] for c in cases]
+    options = ["-- 自定义输入 --"] + case_names
+
+    # 下拉框
+    selected_case_name = st.selectbox(
+        "选择演示病历:",
+        options,
+        index=0
+    )
+
+    # 确定默认文本 (逻辑：如果选了特定病历，就填入内容；否则留空或保持状态)
+    default_text = ""
+    case_desc = "手动输入或粘贴文本"
+
+    if selected_case_name != "-- 自定义输入 --":
+        # 找到对应数据
+        selected_data = next((c for c in cases if c["title"] == selected_case_name), None)
+        if selected_data:
+            default_text = selected_data.get("content", "")
+            case_desc = selected_data.get("description", "")
+
+    st.caption(f"当前场景：{case_desc}")
+
+    st.divider()
+
+    # ------------------------------------------------
+    # 模块 B: 参数调优
+    # ------------------------------------------------
     st.markdown("### 🎛️ 模型参数调优")
     with st.container():
         # 1. 阈值滑块
@@ -67,7 +113,9 @@ with st.sidebar:
 
     st.divider()
 
-    # --- 模块 B: 知识库管理 ---
+    # ------------------------------------------------
+    # 模块 C: 知识库管理
+    # ------------------------------------------------
     st.markdown("### 📚 知识库管理")
     with st.expander("➕ 新增医学文档", expanded=False):
         uploaded_file = st.file_uploader("上传 TXT/MD 说明书", type=["txt", "md"])
@@ -76,7 +124,7 @@ with st.sidebar:
         manual_text = st.text_area("或直接粘贴文本内容", height=100)
         manual_name = st.text_input("文档标题 (用于引用)", value="新补充说明书")
 
-        if st.button("提交入库"):
+        if st.button("提交入库", use_container_width=True):
             content = ""
             source = ""
 
@@ -101,91 +149,108 @@ with st.sidebar:
 
 st.markdown('<div class="main-header">🏥 智能处方审核系统</div>', unsafe_allow_html=True)
 
-# 显示当前生效的参数
-st.info(f"当前生效参数：召回阈值 **{engine.retrieval_threshold}** | 召回数量 **{engine.retrieval_k}**")
+# 显示当前生效的参数状态条
+st.info(f"⚙️ 当前引擎配置：召回阈值 **{engine.retrieval_threshold}** | 召回数量 **{engine.retrieval_k}**")
 
 col1, col2 = st.columns([1, 1])
 
-# 预设病历
-demo_text = """患者：李小宝，男，4岁，体重16kg。
-主诉：发热1天，体温39℃。
-诊断：上呼吸道感染。
-处方：
-1. 布洛芬混悬液 10ml po qid
-2. 左氧氟沙星片 0.1g po bid"""
-
 with col1:
     st.subheader("📋 病历输入")
+
+    # 这里的 value 会根据 sidebar 的选择动态变化
+    # 注意：如果用户手动修改了文本，再切换下拉框，这里会被下拉框的内容覆盖
     medical_input = st.text_area(
-        "病历文本",
-        value=demo_text,
-        height=300
+        "病历文本 (支持编辑)",
+        value=default_text,
+        height=400,
+        help="在此输入或编辑病历信息"
     )
+
     audit_btn = st.button("🚀 开始智能审核", type="primary", use_container_width=True)
 
-if audit_btn and medical_input:
-    with col2:
-        st.subheader("🔍 审核报告")
+if audit_btn:
+    if not medical_input.strip():
+        st.warning("请输入病历文本或在左侧选择演示案例。")
+    else:
+        with col2:
+            st.subheader("🔍 审核报告")
 
-        status_box = st.status("正在进行 AI 药学审查...", expanded=True)
+            status_box = st.status("正在进行 AI 药学审查...", expanded=True)
 
-        try:
-            # 1. 结构化
-            status_box.write("1. 正在结构化病历...")
-            # 2. 检索
-            status_box.write("2. 正在执行多路检索 (使用当前侧边栏参数)...")
-            # 3. 审核
-            status_box.write("3. 正在生成决策...")
+            try:
+                # 1. 结构化
+                status_box.write("1. 正在结构化病历与意图识别...")
 
-            start_time = time.time()
-            result = engine.review_record(medical_input)
-            end_time = time.time()
+                # 2. 检索
+                status_box.write(
+                    f"2. 正在执行多路检索 (Threshold={engine.retrieval_threshold}, K={engine.retrieval_k})...")
 
-            status_box.update(label=f"审核完成 (耗时 {end_time - start_time:.2f}s)", state="complete", expanded=False)
+                # 3. 审核
+                status_box.write("3. 正在生成决策...")
 
-            # === 展示结果 ===
+                start_time = time.time()
+                # 调用核心逻辑
+                result = engine.review_record(medical_input)
+                end_time = time.time()
 
-            # 总结卡片
-            summary = result.get("audit_report_summary", {})
-            decision = summary.get("final_decision", "未知")
-            color = "green"
-            if "拦截" in decision:
-                color = "red"
-            elif "人工" in decision or "慎用" in decision:
-                color = "orange"
+                status_box.update(label=f"审核完成 (耗时 {end_time - start_time:.2f}s)", state="complete",
+                                  expanded=False)
 
-            st.markdown(f"""
-            <div style="padding: 15px; border-left: 5px solid {color}; background-color: #f9f9f9; border-radius: 5px;">
-                <h3 style="color: {color}; margin:0;">🛡️ {decision}</h3>
-                <p style="margin-top:10px;">{summary.get("summary_text", "")}</p>
-            </div>
-            """, unsafe_allow_html=True)
+                # === 展示结果 ===
 
-            st.divider()
+                # 总结卡片
+                summary = result.get("audit_report_summary", {})
+                decision = summary.get("final_decision", "未知")
+                color = "green"
+                if "拦截" in decision:
+                    color = "red"
+                elif "人工" in decision or "慎用" in decision:
+                    color = "orange"
 
-            # 详情与证据
-            st.markdown("#### 🔬 风险详情与证据链")
-            details = result.get("audit_report_details", [])
+                st.markdown(f"""
+                <div style="padding: 15px; border-left: 5px solid {color}; background-color: #f9f9f9; border-radius: 5px;">
+                    <h3 style="color: {color}; margin:0;">🛡️ {decision}</h3>
+                    <p style="margin-top:10px; font-weight:bold;">综合评价：</p>
+                    <p>{summary.get("summary_text", "无")}</p>
+                    <p style="margin-top:10px; font-weight:bold;">建议操作：</p>
+                    <p>{summary.get("actionable_advice", "无")}</p>
+                </div>
+                """, unsafe_allow_html=True)
 
-            if not details:
-                st.info("未发现具体的风险点或未触发检索。")
+                st.divider()
 
-            for item in details:
-                with st.expander(f"💊 查询点：{item['query']}", expanded=True):
-                    st.markdown(f"**AI 结论：** {item['ai_review']}")
+                # 详情与证据
+                st.markdown("#### 🔬 风险详情与证据链")
+                details = result.get("audit_report_details", [])
 
-                    # 只有在 debug 模式下看具体的 evidence
-                    st.caption("📚 检索到的支持证据 (Top 3)：")
-                    # 这里我们需要把 engine 检索过程中的 evidence 传递出来
-                    # 在目前的 review_record 返回结果中，details 里的 evidence_sources 只是文件名
-                    # 如果要看具体文本，需要在 rag_engine 的 _execute_batch_audit 里把文本也存进去
-                    # 咱们目前代码里存的是 sources list，这里展示文件名即可
-                    st.code(f"来源文件: {item.get('evidence_sources', [])}")
+                if not details:
+                    st.info("未发现具体的风险点或未触发检索。")
 
-            # 调试信息
-            with st.expander("查看原始 JSON 响应"):
-                st.json(result)
+                for item in details:
+                    # 图标逻辑
+                    ai_review = item.get('ai_review', '')
+                    icon = "✅"
+                    if any(x in ai_review for x in ["高", "禁忌", "拦截"]):
+                        icon = "🔴"
+                    elif any(x in ai_review for x in ["中", "慎用"]):
+                        icon = "🟠"
 
-        except Exception as e:
-            st.error(f"发生错误: {e}")
-            status_box.update(label="审核失败", state="error")
+                    with st.expander(f"{icon} 查询点：{item['query']}", expanded=True):
+                        st.markdown(f"**AI 结论：**\n\n{ai_review}")
+
+                        st.caption("📚 检索来源：")
+                        sources = item.get('evidence_sources', [])
+                        if sources:
+                            for s in sources:
+                                st.code(s, language=None)
+                        else:
+                            st.text("无相关来源")
+
+                # 调试信息
+                with st.expander("🛠️ 查看原始 JSON 响应 (Debug)"):
+                    st.json(result)
+
+            except Exception as e:
+                st.error(f"发生错误: {e}")
+                status_box.update(label="审核失败", state="error")
+                st.exception(e)
