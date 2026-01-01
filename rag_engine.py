@@ -2,6 +2,7 @@ import logging
 import json
 import re
 import ast
+import os  # 【修正】确保导入 os
 from typing import List, Optional
 
 from langchain_core.documents import Document
@@ -14,13 +15,23 @@ from langchain_core.output_parsers import StrOutputParser
 from model_factory import ModelFactory
 from knowledge_manager import KnowledgeManager
 
-# 图检索支持
+# 【修正 1】引入图检索模块 (Read)
 try:
     from graph_retriever import GraphRetriever
 
     GRAPH_RETRIEVER_AVAILABLE = True
 except ImportError:
     GRAPH_RETRIEVER_AVAILABLE = False
+
+# 【修正 2】引入图谱管理模块 (Write)
+# 假设你把之前的写入代码保存为 graph_builder.py
+try:
+    from graph_builder import MedicalGraphManager
+
+    GRAPH_WRITE_AVAILABLE = True
+except ImportError:
+    GRAPH_WRITE_AVAILABLE = False
+    MedicalGraphManager = None
 
 logger = logging.getLogger(__name__)
 
@@ -31,16 +42,29 @@ class MedicalRAG:
     def __init__(self, data_path: str = "data/", collection_name: str = "medical_db"):
         # 1. 引用模型工厂
         self.models = ModelFactory()
-        # 2. 引用知识库管理
+
+        # 2. 引用知识库管理 (向量库)
         self.knowledge = KnowledgeManager(
             data_path=data_path,
             embedding_model=self.models.embedding_model,
             collection_name=collection_name
         )
-        # 3. 初始化图检索
+
+        # 3. 初始化图谱组件
+        # 3.1 写组件 (Manager)
+        self.graph_manager = None
+        if GRAPH_WRITE_AVAILABLE:
+            try:
+                self.graph_manager = MedicalGraphManager()
+            except Exception as e:
+                logger.error(f"图谱管理器初始化失败: {e}")
+
+        # 3.2 读组件 (Retriever)
         self.graph_retriever = GraphRetriever() if GRAPH_RETRIEVER_AVAILABLE else None
+
         # 4. 构建业务链
         self._build_rag_chain()
+
         # 动态配置参数 (默认值)
         self.retrieval_k = 20
         self.retrieval_threshold = 0.65
@@ -48,42 +72,93 @@ class MedicalRAG:
         self.rerank_top_n = 10
 
     # =========================================================================
-    #  业务功能 1: 混合检索 (完全复原)
+    #  【修正 3】将这些方法移出 __init__，作为类的方法
+    # =========================================================================
+    def add_knowledge_file(self, file_path: str):
+        """
+        全流程新增一个知识文件：
+        1. 读取文本
+        2. 存入向量库 (Vector DB)
+        3. 存入图数据库 (Graph DB)
+        """
+        if not os.path.exists(file_path):
+            return "文件不存在"
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        filename = os.path.basename(file_path)
+
+        results = {}
+
+        # 1. 向量库更新
+        try:
+            vec_success = self.knowledge.add_document(text, filename)
+            results["vector_db"] = "Success" if vec_success else "Failed"
+        except Exception as e:
+            results["vector_db"] = f"Error: {e}"
+
+        # 2. 图数据库更新
+        if self.graph_manager:
+            try:
+                graph_success = self.graph_manager.add_document(text, filename)
+                results["graph_db"] = "Success" if graph_success else "Failed"
+            except Exception as e:
+                results["graph_db"] = f"Error: {e}"
+        else:
+            results["graph_db"] = "Skipped (Manager unavailable)"
+
+        return results
+
+    def delete_drug_knowledge(self, drug_name: str):
+        """
+        从图谱中删除药品 (向量库删除通常较复杂，暂只演示图谱删除)
+        """
+        if self.graph_manager:
+            res = self.graph_manager.delete_document(drug_name)
+            return f"药品 [{drug_name}] 图谱节点已删除: {res}"
+        return "图谱管理器未加载，无法删除。"
+
+    # =========================================================================
+    #  业务功能 1: 混合检索
     # =========================================================================
     def _hybrid_retrieve(self, query: str) -> List[Document]:
         """执行双路检索与统一重排 (Hybrid Retrieval & Rerank)"""
         logger.info(f"--- 开始双路检索: {query} ---")
         all_candidates: List[Document] = []
 
-        # Path A: 图引擎
+        # Path A: 图引擎 (Graph)
         if self.graph_retriever:
             try:
+                # 调用 GraphRetriever.retrieve (返回 List[Document])
                 graph_docs = self.graph_retriever.retrieve(query)
+
                 for doc in graph_docs:
                     doc.metadata["source_type"] = "KnowledgeGraph"
+                    # 给图谱确凿事实较高的初始权重
                     doc.metadata["confidence"] = "high"
-                all_candidates.extend(graph_docs)
-                logger.info(f"Path A (Graph) 命中 {len(graph_docs)} 条结构化证据")
+
+                if graph_docs:
+                    logger.info(f"Path A (Graph) 命中 {len(graph_docs)} 条结构化证据")
+                    all_candidates.extend(graph_docs)
             except Exception as e:
                 logger.warning(f"图引擎检索异常: {e}")
 
-        # Path B: 向量引擎
+        # Path B: 向量引擎 (Vector)
         if self.knowledge.vector_store:
             try:
                 results_with_score = self.knowledge.vector_store.similarity_search_with_score(query, k=self.retrieval_k)
                 valid_docs = []
-                # [修改] 使用动态阈值
                 current_threshold = self.retrieval_threshold
                 for doc, score in results_with_score:
                     if score >= current_threshold:
                         doc.metadata["source_type"] = "VectorDB"
                         valid_docs.append(doc)
-                all_candidates.extend(valid_docs)
                 logger.info(f"Path B (Vector) 召回 {len(valid_docs)} 条非结构化片段")
+                all_candidates.extend(valid_docs)
             except Exception as e:
                 logger.error(f"向量检索异常: {e}")
 
-        # Path C: 统一重排
+        # Path C: 统一重排 (Rerank)
         if not all_candidates:
             return []
 
@@ -97,21 +172,25 @@ class MedicalRAG:
 
         try:
             logger.debug(f"合并后候选集 {len(candidates_list)} 条，开始 Rerank...")
-            compressor = CrossEncoderReranker(model=self.models.reranker, top_n=3)
+            # 这里的 rerank_top_n 使用 self.rerank_top_n 保持配置一致性
+            compressor = CrossEncoderReranker(model=self.models.reranker, top_n=self.rerank_top_n)
             reranked_docs = compressor.compress_documents(documents=candidates_list, query=query)
-            # 调试日志：看看最终选了啥
+
+            # 调试日志
             for i, d in enumerate(reranked_docs):
-                src = d.metadata.get("source", "未知")
-                content_preview = d.page_content[:50].replace("\n", " ")
-                logger.debug(f"Top-{i+1} [{src}]: {content_preview}...")
+                src = d.metadata.get("source_type", "Unknown")  # 优化日志显示 source_type
+                content_preview = d.page_content[:30].replace("\n", " ")
+                logger.debug(f"Top-{i + 1} [{src}]: {content_preview}...")
 
             return reranked_docs
         except Exception as e:
             logger.error(f"Rerank 失败，降级为原始顺序: {e}")
-            return candidates_list[:3]
+            return candidates_list[:self.rerank_top_n]
+
+    # ... (后续的 _rewrite_query, _build_rag_chain, ask 等方法不需要修改，保持你原代码即可)
 
     def _rewrite_query(self, query: str) -> str:
-        """基于规则的简单重写"""
+        # (保持你原代码不变)
         rewrite_rules = {
             "血糖高": "高血糖",
             "糖尿": "糖尿病",
@@ -123,8 +202,7 @@ class MedicalRAG:
         return rewritten
 
     def _build_rag_chain(self):
-        """构建问答链"""
-
+        # (保持你原代码不变)
         def format_docs_with_sources(docs):
             if not docs or all(not doc.page_content.strip() for doc in docs):
                 return {"context": "", "sources": ""}
@@ -231,13 +309,10 @@ class MedicalRAG:
         return f"{answer}\n\n（资料来源：{sources}）"
 
     # =========================================================================
-    #  业务功能 2: 病历检阅 (Review Record) - 完全复原
+    #  业务功能 2: 病历检阅 (Review Record)
+    #  (以下部分保持你原代码不变，不需要修改)
     # =========================================================================
-
     def _build_review_prompt(self, medical_text: str) -> str:
-        """
-        [完全复原] 构建病历检阅 Prompt，包含所有原有字段。
-        """
         return f"""
         你是一名资深的病历结构化专家。请阅读下方的【待处理病历文本】，提取关键信息填入指定的 JSON 格式。
 
@@ -245,14 +320,14 @@ class MedicalRAG:
         1. **完整性**：如果处方中有多种药物，**必须全部提取**，存入 medications 列表，严禁遗漏。
         2. **准确性**：数值和单位必须与原文一致。
         3. **格式**：只输出标准的 JSON 字符串，不要包含 Markdown 标记（如 ```json），不要包含注释。
-        4. **空值处理**：未提及的字段填 null。
+        4. **极简输出**：仅输出病历中明确提及的字段。未提及的字段**不要包含在 JSON 中**，直接省略。
         5. **兼容性**：必须输出标准 JSON (null, true, false)，严禁使用 Python 风格 (None, True, False)。
         【目标 JSON 结构定义】
         - patient_info: 患者基本信息 (age, gender, vital_signs_extracted)
         - medical_history: 病史 (chief_complaint, symptoms_list=[症状1, 症状2...])
         - diagnosis_info: 诊断 (clinical_diagnosis=[诊断1, 诊断2...])
         - treatment_plan: 治疗方案 (medications=[{{name, specification, usage}}])
-        
+
         【输出模板】
         {{
           "patient_info": {{
@@ -363,44 +438,6 @@ class MedicalRAG:
         match = re.search(r"\{[\s\S]*\}", text)
         return match.group(0) if match else None
 
-    # def _parse_or_repair_json(self, text: str, medical_text: str) -> dict:
-    #     """
-    #             解析 JSON，具备极强的容错能力：
-    #             1. 去除 Markdown
-    #             2. 尝试标准 JSON 解析 (json.loads)
-    #             3. 尝试 Python 字面量解析 (ast.literal_eval) -> 解决 None/True/False/单引号问题
-    #             4. 尝试正则修正 (None->null)
-    #             5. LLM 修复
-    #             """
-    #     # --- 预处理：去除 Markdown 标记 ---
-    #     cleaned_text = text.strip()
-    #     # 去除 ```json ... ``` 或 ``` ... ```
-    #     if cleaned_text.startswith("```"):
-    #         # 找到第一个换行符
-    #         first_newline = cleaned_text.find("\n")
-    #         if first_newline != -1:
-    #             cleaned_text = cleaned_text[first_newline + 1:]
-    #         if cleaned_text.endswith("```"):
-    #             cleaned_text = cleaned_text[:-3]
-    #     cleaned_text = cleaned_text.strip()
-    #
-    #     try:
-    #         return json.loads(cleaned_text)
-    #     except Exception:
-    #         logger.warning("JSON 直接解析失败，尝试修复")
-    #         pass
-    #     extracted = self._extract_json_block(text)
-    #     if extracted:
-    #         try:
-    #             return json.loads(extracted)
-    #         except:
-    #             pass
-    #
-    #     repaired = self._repair_json_with_llm(text, medical_text)
-    #     try:
-    #         return json.loads(repaired)
-    #     except:
-    #         return self._fallback_empty_review()
     def _parse_or_repair_json(self, text: str, medical_text: str) -> dict:
         """
         解析 JSON，具备极强的容错能力：
@@ -476,161 +513,6 @@ class MedicalRAG:
             logger.error(f"LLM 修复后仍无法解析: {e}")
             return self._fallback_empty_review()
 
-    # def _decompose_case_to_atomic_queries(self, case_json: dict) -> List[str]:
-    #     """[完全复原] 将病例拆解为原子查询"""
-    #     patient = case_json.get("patient_info", {}) or {}
-    #     diagnosis_info = case_json.get("diagnosis_info", {}) or {}
-    #     clinical_diagnosis = diagnosis_info.get("clinical_diagnosis", []) or []
-    #     treatment_plan = case_json.get("treatment_plan") or {}
-    #     meds = treatment_plan.get("medications") or []
-    #
-    #     real_drug_names = []
-    #     valid_meds_str_list = []
-    #     for m in meds:
-    #         if isinstance(m, dict):
-    #             name = m.get('name')
-    #             usage = m.get('usage')
-    #             if name:
-    #                 real_drug_names.append(name)
-    #                 med_str = f"{name} {usage or ''}".strip()
-    #                 valid_meds_str_list.append(med_str)
-    #
-    #     meds_context = ", ".join(valid_meds_str_list) if valid_meds_str_list else "无明确处方记录"
-    #     drug_names_str = ", ".join(real_drug_names) if real_drug_names else "无"
-    #
-    #     context_str = (
-    #         f"患者: {patient.get('age', '未知')}, {patient.get('gender', '未知')}\n"
-    #         f"诊断: {', '.join(clinical_diagnosis)}\n"
-    #         f"处方: {meds_context}"
-    #     )
-    #
-    #     system_instruction = (
-    #         "你是一个专业的【医学检索查询生成器】。\n"
-    #         "你的任务是生成搜索语句（String），而不是提取数据。\n"
-    #         "【严禁】输出 Key-Value 字典或对象。\n"
-    #         "【必须】输出纯字符串列表，例如：[\"查询语句1\", \"查询语句2\"]。"
-    #     )
-    #
-    #     user_prompt = f"""
-    #     请将以下病例拆解为用于向量检索的【原子查询语句】。
-    #
-    #     【病例信息】
-    #     {context_str}
-    #
-    #     【当前药物列表】
-    #     {meds_context}
-    #
-    #     【生成任务】(请严格执行，不要输出对象，只输出句子)
-    #     1. 用法用量：
-    #        - 生成：{drug_names_str}在{patient.get('age', '该年龄段')}中的用法用量
-    #     2. 禁忌症：
-    #        - 生成：{drug_names_str}的禁忌症
-    #     3. 适应症匹配：
-    #        - 对每个诊断生成：{drug_names_str}是否适用于[诊断]
-    #     4. 相互作用：
-    #        - (如果处方只有1种药，请忽略此项，不要生成null)
-    #
-    #     【格式强制要求】
-    #     - 输出必须是 JSON 字符串列表 (List[str])。
-    #     - 列表中的元素必须是完整的自然语言句子。
-    #     - 正确格式：["乳果糖的用法用量", "乳果糖是否适用于便秘"]
-    #
-    #     【请直接输出结果，不要包含Markdown标记】
-    #     """
-    #
-    #     try:
-    #         logger.debug("正在生成原子查询...")
-    #         messages = [{"role": "system", "content": system_instruction}, {"role": "user", "content": user_prompt}]
-    #         # 直接调用 ollama，绕过 invoke_llm，和原代码一致
-    #         response = self.models.ollama.generate(messages)
-    #
-    #         match = re.search(r"\[[\s\S]*\]", response)
-    #         if match:
-    #             queries = json.loads(match.group(0))
-    #             return [str(q) for q in queries if isinstance(q, str)]
-    #         else:
-    #             return self._fallback_decomposition(meds)
-    #     except Exception as e:
-    #         logger.error(f"查询拆解失败: {e}")
-    #         return self._fallback_decomposition(meds)
-    # def _decompose_case_to_atomic_queries(self, case_json: dict) -> List[str]:
-    #     """
-    #     [优化版] 将病例拆解为原子查询
-    #     策略：强制要求 LLM 对【每个药物】生成独立查询，禁止合并，提高检索命中率。
-    #     """
-    #     patient = case_json.get("patient_info", {}) or {}
-    #     diagnosis_info = case_json.get("diagnosis_info", {}) or {}
-    #     clinical_diagnosis = diagnosis_info.get("clinical_diagnosis", []) or []
-    #     treatment_plan = case_json.get("treatment_plan") or {}
-    #     meds = treatment_plan.get("medications") or []
-    #
-    #     # 提取药物名称列表
-    #     real_drug_names = []
-    #     for m in meds:
-    #         if isinstance(m, dict) and m.get('name'):
-    #             real_drug_names.append(m.get('name'))
-    #
-    #     # 如果没有药物，直接返回
-    #     if not real_drug_names:
-    #         return []
-    #
-    #     # 构造上下文
-    #     patient_str = f"{patient.get('age', '未知年龄')} {patient.get('gender', '未知性别')}"
-    #     diagnosis_str = ', '.join(clinical_diagnosis)
-    #     drugs_json_str = json.dumps(real_drug_names, ensure_ascii=False)  # ["布洛芬", "左氧氟沙星"]
-    #
-    #     system_instruction = (
-    #         "你是一个医学检索查询生成器。\n"
-    #         "你的任务是为列表中的【每一个药物】生成独立的检索语句。\n"
-    #         "【严禁】将多个药物合并在同一个查询中（如'A和B的禁忌'是错误的）。\n"
-    #         "【必须】输出纯字符串列表 List[str]。"
-    #     )
-    #
-    #     user_prompt = f"""
-    #     请根据以下信息生成原子化检索查询。
-    #
-    #     【患者信息】{patient_str}
-    #     【诊断信息】{diagnosis_str}
-    #     【药物列表】{drugs_json_str}
-    #
-    #     【生成规则】
-    #     请遍历【药物列表】，对**每一个药物**分别生成以下3个维度的查询语句：
-    #     1. 用法用量："[药物名] 说明书 用法用量 儿童/老人/孕妇" (根据患者特征调整)
-    #     2. 禁忌症："[药物名] 禁忌症"
-    #     3. 相互作用："[药物名] 与其他药物的相互作用" (如果只有1种药则跳过此项)
-    #     4. 适应症："[药物名] 是否适用于 [诊断]"
-    #
-    #     【示例】
-    #     输入药物: ["阿莫西林", "布洛芬"]，患者: 3岁
-    #     输出: [
-    #         "阿莫西林在3岁儿童中的用法用量",
-    #         "阿莫西林禁忌症",
-    #         "阿莫西林是否适用于感冒",
-    #         "布洛芬在3岁儿童中的用法用量",
-    #         "布洛芬禁忌症",
-    #         "布洛芬是否适用于感冒",
-    #         "阿莫西林与布洛芬的相互作用"
-    #     ]
-    #
-    #     【请直接输出 JSON 列表】
-    #     """
-    #
-    #     try:
-    #         logger.debug("正在生成原子查询 (One-by-One Strategy)...")
-    #         messages = [{"role": "system", "content": system_instruction}, {"role": "user", "content": user_prompt}]
-    #         response = self.models.ollama.generate(messages)
-    #
-    #         match = re.search(r"\[[\s\S]*\]", response)
-    #         if match:
-    #             queries = json.loads(match.group(0))
-    #             # 再次清洗，确保都是字符串
-    #             return [str(q) for q in queries if isinstance(q, str)]
-    #         else:
-    #             return self._fallback_decomposition(meds)
-    #     except Exception as e:
-    #         logger.error(f"查询拆解失败: {e}")
-    #         return self._fallback_decomposition(meds)
-
     def _decompose_case_to_atomic_queries(self, case_json: dict) -> List[str]:
         """
         [增强版] 将病例拆解为原子查询
@@ -696,7 +578,7 @@ class MedicalRAG:
         1. [药物名] 说明书 用法用量 {age_query_suffix} (已注入年龄泛化词)
         2. [药物名] 禁忌症 {age_query_suffix}
         3. [药物名] 是否适用于 [诊断]
-        
+
         【示例】
         输入: ["A药", "B药"]
         输出: [
@@ -765,129 +647,6 @@ class MedicalRAG:
                 queries.append(f"{name} 药物相互作用")
         return queries
 
-    # def _execute_batch_audit(self, queries: List[str], case_context: dict) -> dict:
-    #     """
-    #     [完全复原] 执行批量审核与整体总结 (Map-Reduce 逻辑)
-    #     """
-    #     results = []
-    #
-    #     # --- 阶段 1: 单点审核 (Map) ---
-    #     for query in queries:
-    #         try:
-    #             # 1. 复用混合检索
-    #             docs = self._hybrid_retrieve(query)
-    #             # 【关键修改】: 召回为空时的兜底逻辑
-    #             if not docs:
-    #                 logger.warning(f"查询 '{query}' 未召回任何文档，触发安全警告。")
-    #                 results.append({
-    #                     "query": query,
-    #                     "evidence_sources": ["❌ 知识库无相关数据"],
-    #                     "ai_review": "⚠️ **系统警告**：当前知识库中未找到该药物/症状的相关说明书或指南，无法进行智能评估。请药师务必**人工核查**此项。"
-    #                 })
-    #                 continue
-    #
-    #             # 2. 构造单点审核 Prompt
-    #             context_text = "\n".join([d.page_content[:300] for d in docs])
-    #             sources = list(set([d.metadata.get("source", "未知") for d in docs]))
-    #
-    #             audit_prompt = f"""
-    #             你是一名药品安全审核员。请依据证据对当前查询进行风险评估。
-    #             【当前查询】: {query}
-    #             【医学证据】: {context_text}
-    #             【任务】: 判断是否存在用药风险。
-    #             【输出要求】: 简练的一句话结论，指明风险等级(高/中/低/无)。
-    #             """
-    #
-    #             # 3. 调用 LLM
-    #             review_res = self.models.ollama.generate([
-    #                 {"role": "system", "content": "你是一个严谨的药学审核助手。请简练回答。"},
-    #                 {"role": "user", "content": audit_prompt}
-    #             ])
-    #
-    #             results.append({
-    #                 "query": query,
-    #                 "evidence_sources": sources,
-    #                 "ai_review": review_res
-    #             })
-    #
-    #         except Exception as e:
-    #             logger.error(f"审核查询 '{query}' 时发生错误: {e}")
-    #
-    #     # --- 阶段 2: 整体总结 (Reduce) ---
-    #     if not results:
-    #         return {
-    #             "details": [],
-    #             "overall_analysis": {
-    #                 "final_decision": "无需审核",
-    #                 "max_risk_level": "无",
-    #                 "summary_text": "未生成有效查询或未触发审核规则，系统判断无风险。",
-    #                 "actionable_advice": "无"
-    #             }
-    #         }
-    #
-    #     logger.info("单点审核完成，正在生成整体综述报告...")
-    #     try:
-    #         # 1. 准备汇总上下文
-    #         patient_info = case_context.get("patient_info", {})
-    #         diagnosis_str = ", ".join(case_context.get("diagnosis_info", {}).get("clinical_diagnosis", []))
-    #
-    #         audit_trace = "\n".join([
-    #             f"- 检查点: {r['query']}\n  AI发现: {r['ai_review']}"
-    #             for r in results
-    #         ])
-    #
-    #         # 2. 构造“主审药师” Prompt
-    #         summary_prompt = f"""
-    #         你是一名三甲医院的【主任药师】。请根据下方的【患者信息】和【单项审核记录】，生成一份最终的用药安全综合评估报告。
-    #
-    #         【患者信息】
-    #         年龄: {patient_info.get('age', '未知')}, 性别: {patient_info.get('gender', '未知')}
-    #         诊断: {diagnosis_str}
-    #
-    #         【系统单项审核记录】
-    #         {audit_trace}
-    #
-    #         【你的任务】
-    #         1. 综合分析所有检查结果，判断是否存在冲突（例如：一个通过，另一个提示高风险）。
-    #         2. 给出最终的决策建议（通过 / 拦截 / 提示医生慎用）。
-    #         3. 如果有风险，请按照严重程度排序说明。
-    #
-    #         【输出格式 (JSON)】
-    #         请直接输出合法的 JSON，不要包含 Markdown 标记：
-    #         {{
-    #             "final_decision": "通过/拦截/人工复核",
-    #             "max_risk_level": "高/中/低/无",
-    #             "summary_text": "简短的综合评价（100字以内）",
-    #             "actionable_advice": "给医生的具体建议（如：建议停用XX药，改用XX）"
-    #         }}
-    #         """
-    #
-    #         # 3. 调用 LLM
-    #         final_verdict_raw = self.models.ollama.generate([
-    #             {"role": "system", "content": "你是由系统生成的最终决策层，必须输出 JSON 格式。"},
-    #             {"role": "user", "content": summary_prompt}
-    #         ])
-    #
-    #         # 4. 解析
-    #         import json, re
-    #         try:
-    #             match = re.search(r"\{[\s\S]*\}", final_verdict_raw)
-    #             if match:
-    #                 overall_analysis = json.loads(match.group(0))
-    #             else:
-    #                 overall_analysis = {"raw_text": final_verdict_raw}
-    #         except:
-    #             overall_analysis = {"raw_text": final_verdict_raw, "parse_error": "JSON解析失败"}
-    #
-    #     except Exception as e:
-    #         logger.error(f"生成整体总结时出错: {e}")
-    #         overall_analysis = {"error": str(e)}
-    #
-    #     return {
-    #         "details": results,
-    #         "overall_analysis": overall_analysis
-    #     }
-
     def _execute_batch_audit(self, queries: List[str], case_context: dict) -> dict:
         """
         [防幻觉优化版] 执行批量审核
@@ -899,6 +658,9 @@ class MedicalRAG:
         patient_info = case_context.get("patient_info", {})
         age_str = patient_info.get("age", "未知")
         gender = patient_info.get("gender", "未知")
+        diagnosis_info = case_context.get("diagnosis_info", {})
+        diagnosis_list = diagnosis_info.get("clinical_diagnosis", [])
+        diagnosis_str = ", ".join(diagnosis_list) if diagnosis_list else "未明确诊断"
 
         for query in queries:
             try:
@@ -934,15 +696,19 @@ class MedicalRAG:
                 【医学证据片段】
                 {context_text}
 
-                【审查步骤】
-                1. **来源核对（关键）**：请检查每个片段的“来源”或内容中的“药品名称”。
-                   - 如果片段是关于【{target_drug}】的，请采信。
-                   - 如果片段是关于其他药物（如左氧氟沙星、阿司匹林等）的，**请直接忽略，严禁引用**。
-                2. **提取限制**：仅从核对无误的片段中，寻找关于“年龄”、“禁忌”的描述。
-                3. **判定风险**：
-                   - 高风险：证据明确说“禁用”。
-                   - 中风险：证据说“慎用”或“未进行实验”。
-                   - 低风险：用法明确且适用。
+                【审查核心逻辑（请严格遵守）】
+                1. **适应症优先原则**：首先检查药物是否用于治疗患者的【诊断】。
+                   - 如果**对症**（如缺铁性贫血用铁剂），且用法用量正常，基础判定为**“低风险（通过）”**。
+                2. **禁忌症排查（无罪推定）**：
+                   - 只有当【患者病历】中**明确记载**了说明书中列出的“禁用”情况（如明确写了“胃溃疡”、“肝炎”）时，才判定为风险。
+                   - **如果病历未提及某疾病（如未提酒精中毒），默认患者没有该问题，严禁因此提示风险。**
+                3. **副作用/注意事项**：
+                   - 常规副作用（如恶心、便秘）属于正常告知范围，**不属于审核拦截的风险**，判定为低风险。
+
+                【输出标准】
+                - **高风险**：患者病历中**明确存在**“禁用”条件（如：年龄不符、明确的过敏史、明确的禁忌症候）。
+                - **中风险**：用法用量严重超标，或存在严重的药物相互作用冲突。
+                - **低风险**：药物对症，用法在正常范围内，且病历中无明确禁忌证据。（即使说明书有很多慎用条款，只要患者没这些病，就是低风险）。
 
                 【输出要求】
                 简练回答，格式：“风险等级：X。理由：...”。引用证据时请注明片段来源。
@@ -972,7 +738,11 @@ class MedicalRAG:
             audit_trace = "\n".join([f"- {r['query']} -> {r['ai_review']}" for r in results])
             summary_prompt = f"""
             汇总药师审核结果，给出最终处方建议。
-            【患者】{age_str} {gender}
+            患者基本信息】
+            - 年龄：{age_str}
+            - 性别：{gender}
+            - 临床诊断：{diagnosis_str}  <-- 【新增】加上这一行
+            
             【审核记录】
             {audit_trace}
 
@@ -1041,13 +811,17 @@ class MedicalRAG:
         logger.info("病历检阅流程结束。")
         return extracted_data
 
-# [新增] 暴露给前端的动态配置接口
-    def update_config(self, k: int, threshold: float, kn: int,):
+    # [新增] 暴露给前端的动态配置接口
+    def update_config(self, k: int, threshold: float, kn: int, ):
         self.retrieval_k = k
         self.retrieval_threshold = threshold
         self.rerank_top_n = kn
         logger.info(f"配置已更新: K={k}, Threshold={threshold}, rerank_top_n = ={kn}")
 
     # [新增] 暴露给前端的知识库新增接口
+    # 建议使用 add_knowledge_file 替代此方法，或者在这里也加入图谱逻辑
     def add_knowledge(self, text: str, filename: str):
+        # 复用 add_knowledge_file 的逻辑
+        if self.graph_manager:
+            self.graph_manager.add_document(text, filename)
         return self.knowledge.add_document(text, filename)

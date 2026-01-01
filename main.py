@@ -173,6 +173,7 @@ def main():
                 print("=" * 40)
                 print("1 - 病历检阅模式")
                 print("2 - 医学问答模式")
+                print("3 - 管理模式：新增/删除药品说明书")
                 print("exit - 退出系统")
                 print("=" * 40)
                 continue
@@ -185,6 +186,16 @@ def main():
                 run_review_mode(rag)
             elif cmd == "2":
                 run_qa_mode(rag)
+            elif cmd == "3":
+                  action = input("请输入操作 (add/del): ").strip()
+                  if action == "add":
+                      f_path = input("请输入txt文件路径 (例如 data/new_drug.txt): ")
+                      res = rag.add_knowledge_file(f_path)
+                      print(f"执行结果: {res}")
+                  elif action == "del":
+                      d_name = input("请输入要删除的药品通用名 (例如 左氧氟沙星片): ")
+                      res = rag.delete_drug_knowledge(d_name)
+                      print(f"执行结果: {res}")
             else:
                 print("无效指令，请输入 1, 2, exit 或 m (显示菜单)")
                 continue

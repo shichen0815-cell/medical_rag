@@ -103,39 +103,104 @@ class GraphRetriever:
 
     def retrieve(self, query: str) -> List[Document]:
         """
-        从 Neo4j 检索与 query 相关的医学关系。
+        [优化版] 从 Neo4j 检索，适配 MedicalGraphManager 的 Schema
         """
         if not self.driver:
             return []
 
+        # 1. 提取实体 (NER + 简单的包含匹配作为兜底)
         keywords = self._extract_medical_entities(query)
+
+        # 【兜底策略】如果 NER 没提取到，尝试直接把 query 当作关键词去数据库碰运气
+        # 实际生产中，建议有一个药名词典做 AC 自动机匹配
+        if not keywords and len(query) < 10:
+            keywords = [query]
+
         if not keywords:
-            logger.debug("未提取到有效医学实体，跳过图数据库查询。")
+            logger.debug("未提取到有效实体，跳过图检索。")
             return []
 
-        cypher = """
-        MATCH (n)-[r]->(m)
-        WHERE n.name IN $keywords OR m.name IN $keywords
-        RETURN DISTINCT
-            n.name AS source,
-            type(r) AS relation,
-            m.name AS target,
-            coalesce(r.description, '') AS desc
-        LIMIT 15
-        """
+        docs = []
+
+        # 2. 定义关系映射表 (Schema -> 自然语言)
+        # 对应 MedicalGraphManager 中的关系定义
+        rel_map = {
+            "TREATING": "治疗/适应症",
+            "CONTRAINDICATES": "禁忌/禁止",
+            "HAS_COMPONENT": "主要成分",
+            "HAS_ADVERSE_REACTION": "不良反应/副作用"
+        }
+
         try:
             with self.driver.session() as session:
-                result = session.run(cypher, keywords=keywords)
-                docs = []
-                for record in result:
+                # === 查询 A: 获取药品节点的自身属性 (用法用量) ===
+                # 你的写入逻辑中：d.usage_dosage
+                usage_cypher = """
+                MATCH (n:Drug)
+                WHERE n.name IN $keywords
+                RETURN n.name AS name, n.usage_dosage AS usage, n.source_file AS source
+                """
+                usage_result = session.run(usage_cypher, keywords=keywords)
+                for record in usage_result:
+                    name = record["name"]
+                    usage = record["usage"]
+                    source = record.get("source", "知识图谱")
+
+                    if usage:
+                        text = f"【用法用量】{name}的使用说明：{usage}"
+                        docs.append(Document(page_content=text, metadata={"source": source, "type": "usage"}))
+
+                # === 查询 B: 获取关联关系 ===
+                # 修改点：不再查 r.description，而是查 type(r) 并手动映射
+                rel_cypher = """
+                MATCH (n)-[r]->(m)
+                WHERE n.name IN $keywords
+                RETURN n.name AS source, type(r) AS rel_type, m.name AS target
+                LIMIT 20
+                """
+                rel_result = session.run(rel_cypher, keywords=keywords)
+
+                # 聚合结果，避免碎片化 (比如把所有禁忌合并成一句话)
+                relations_buffer = {
+                    "TREATING": [],
+                    "CONTRAINDICATES": [],
+                    "HAS_COMPONENT": [],
+                    "HAS_ADVERSE_REACTION": []
+                }
+
+                drug_name = ""
+                for record in rel_result:
                     src = record["source"]
-                    rel = record["relation"]
+                    rel_type = record["rel_type"]
                     tgt = record["target"]
-                    desc = record["desc"]
-                    text = f"{src} {rel} {tgt}：{desc}" if desc.strip() else f"{src} {rel} {tgt}。"
-                    docs.append(Document(page_content=text, metadata={"source": "neo4j"}))
-                logger.debug(f"图数据库返回 {len(docs)} 条结果。")
-                return docs
+                    drug_name = src  # 记录当前药名
+
+                    if rel_type in relations_buffer:
+                        relations_buffer[rel_type].append(tgt)
+
+                # 将聚合后的数据转换为自然语言 Document
+                for r_type, targets in relations_buffer.items():
+                    if not targets:
+                        continue
+
+                    cn_rel_name = rel_map.get(r_type, r_type)
+                    targets_str = "、".join(targets)
+
+                    # 生成符合人类阅读习惯的句子
+                    if r_type == "CONTRAINDICATES":
+                        content = f"【禁忌症】{drug_name}的{cn_rel_name}对象包括：{targets_str}。此类人群请禁用。"
+                    elif r_type == "TREATING":
+                        content = f"【适应症】{drug_name}主要用于{cn_rel_name}：{targets_str}。"
+                    elif r_type == "HAS_ADVERSE_REACTION":
+                        content = f"【不良反应】{drug_name}可能引起{cn_rel_name}：{targets_str}。"
+                    else:
+                        content = f"{drug_name}的{cn_rel_name}包括：{targets_str}。"
+
+                    docs.append(Document(page_content=content, metadata={"source": "知识图谱", "type": "relation"}))
+
+            logger.info(f"图数据库检索命中关键词 {keywords}，生成 {len(docs)} 条证据。")
+            return docs
+
         except Exception as e:
             logger.error(f"图数据库查询出错: {e}")
             return []
