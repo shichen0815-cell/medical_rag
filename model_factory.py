@@ -145,7 +145,6 @@ class ModelFactory:
                 "device": "mps",  # Mac使用 mps，服务器使用 cuda
                 "model_kwargs": {
                     "trust_remote_code": True,
-                    # 【核心修改】这里设置为 float16
                     "torch_dtype": torch.float16
                 }
             }
