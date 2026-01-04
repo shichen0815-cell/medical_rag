@@ -3,13 +3,42 @@ import time
 import json
 import os
 from rag_engine import MedicalRAG
-
+import logging
 # ================= 页面配置 =================
 st.set_page_config(
     page_title="AI 药师工作台 (图谱增强版)",
     page_icon="🏥",
     layout="wide"
 )
+
+
+# 使用 Streamlit 的缓存机制，确保日志只配置一次，不会因为页面刷新而重复添加
+@st.cache_resource
+def setup_logging(log_file="medical_rag.log"):
+    # 1. 获取根记录器
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+
+    # 2. 清除已有的 FileHandler (防止重复写入)
+    # 注意：不要清除 StreamHandler，否则控制台看不到了
+    for handler in logger.handlers[:]:
+        if isinstance(handler, logging.FileHandler):
+            logger.removeHandler(handler)
+
+    # 3. 创建新的 FileHandler
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+
+    # 4. 添加到根记录器
+    logger.addHandler(file_handler)
+
+    print(f"日志系统已初始化，输出文件: {os.path.abspath(log_file)}")
+    return logger
+
+
+# 执行初始化
+setup_logging()
 
 # ================= CSS 美化 =================
 st.markdown("""
