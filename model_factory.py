@@ -140,11 +140,25 @@ class ModelFactory:
         try:
             reranker_path = "models/bge-reranker-v2-m3"
             target_model = reranker_path if os.path.exists(reranker_path) else "BAAI/bge-reranker-v2-m3"
-            self.reranker = HuggingFaceCrossEncoder(model_name=target_model)
+            self.reranker_args = {
+                "model_name": target_model,
+                "device": "mps",  # Mac使用 mps，服务器使用 cuda
+                "model_kwargs": {
+                    "trust_remote_code": True,
+                    # 【核心修改】这里设置为 float16
+                    "torch_dtype": torch.float16
+                }
+            }
+            self.reranker = HuggingFaceCrossEncoder(
+                model_name=self.reranker_args["model_name"],
+                model_kwargs = self.reranker_args["model_kwargs"]
+            )
         except Exception as e:
             logger.error(f"重排器加载失败: {e}", exc_info=True)
             logger.warning("→ 使用备用重排器")
-            self.reranker = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
+            self.reranker = HuggingFaceCrossEncoder(
+                model_name="cross-encoder/ms-marco-MiniLM-L-6-v2"
+            )
 
         # 3. Main LLM
         logger.info("加载本地 LLM (Qwen/Qwen2.5-0.5B-Instruct)...")
