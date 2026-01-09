@@ -691,144 +691,176 @@ class MedicalRAG:
 
     def _execute_batch_audit(self, queries: List[str], case_context: dict) -> dict:
         """
-        [防幻觉优化版 - 并行加速] 执行批量审核
-        核心改进：
-        1. 防止 LLM 张冠李戴。
-        2. 使用线程池并行执行检索和审核，大幅降低总耗时。
+        [三甲医院标准版] 通用药物审核引擎
+
+        设计哲学：遵循 JCI/HIMSS 药学审核标准，采用"五维审核架构"。
+        不再硬编码具体规则，而是赋予 LLM 完整的药学评估逻辑框架。
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         results = []
 
-        # 1. 提取公共上下文信息 (避免在线程中重复提取)
-        patient_info = case_context.get("patient_info", {})
-        age_str = patient_info.get("age", "未知")
-        gender = patient_info.get("gender", "未知")
-        diagnosis_info = case_context.get("diagnosis_info", {})
-        diagnosis_list = diagnosis_info.get("clinical_diagnosis", [])
+        # 1. 深度结构化上下文 (Deep Context Extraction)
+        # 不仅提取基本信息，还提取共病、肝肾功能、联用药物
+        patient = case_context.get("patient_info", {})
+        age = patient.get("age", "未知")
+        gender = patient.get("gender", "未知")
+
+        # 提取关键体征/检验值 (eGFR 是老年人用药的生命线)
+        history = case_context.get("medical_history", {})
+        pmh = history.get("past_medical_history") or ""
+        hpi = history.get("history_present_illness") or ""
+        full_history = f"{pmh}; {hpi}"
+
+        # 提取诊断
+        diagnosis_list = case_context.get("diagnosis_info", {}).get("clinical_diagnosis", [])
         diagnosis_str = ", ".join(diagnosis_list) if diagnosis_list else "未明确诊断"
 
-        # 2. 定义单个查询的处理逻辑 (Worker Function)
+        # 提取处方全貌 (用于相互作用检查)
+        med_list = case_context.get("treatment_plan", {}).get("medications", [])
+        all_med_names = [m.get('name') for m in med_list if m.get('name')]
+        all_meds_str = ", ".join(all_med_names)
+
+        # 2. Worker Function
         def _process_single_query(query: str):
             try:
-                # 2.1 检索
+                # --- 步骤 A: 检索 (RAG) ---
                 docs = self._hybrid_retrieve(query)
-
                 if not docs:
-                    return {
-                        "query": query,
-                        "evidence_sources": ["❌ 知识库缺失"],
-                        "ai_review": "⚠️ **资料缺失**：未检索到说明书，无法判断。"
-                    }
+                    return {"query": query, "evidence_sources": [], "ai_review": "⚠️ 资料缺失：知识库未收录相关说明书。"}
 
-                # 2.2 构造带来源的上下文
+                # 构造证据文本
                 context_parts = []
                 for i, d in enumerate(docs):
-                    src = d.metadata.get("source", "未知来源")
-                    content = d.page_content[:400].replace("\n", " ")  # 压缩换行
-                    context_parts.append(f"片段{i + 1} (来源: {src}): {content}")
-
-                context_text = "\n\n".join(context_parts)
+                    src = d.metadata.get("source", "未知")
+                    # 截取更长的片段以包含剂量表
+                    content = d.page_content[:600].replace("\n", " ")
+                    context_parts.append(f"证据{i + 1} [来源:{src}]: {content}")
+                context_text = "\n".join(context_parts)
                 sources = list(set([d.metadata.get("source", "未知") for d in docs]))
 
-                # 从 Query 中提取当前正在查的药物名
-                target_drug = query.split(" ")[0]
+                # --- 步骤 B: 锁定当前审核目标 ---
+                # 从查询中通过简单的切分获取当前正在查的主药
+                # 假设查询格式为 "[药名] ..."
+                target_drug_name = query.split(" ")[0]
 
-                # 2.3 构造防幻觉 Prompt (内容保持不变)
+                # 查找该药物在处方中的具体用法 (如 "40mg po qn")
+                current_usage = "用法未明"
+                for m in med_list:
+                    if m.get('name') in target_drug_name or target_drug_name in m.get('name'):
+                        spec = m.get('specification', '')
+                        usage = m.get('usage', '')
+                        current_usage = f"{spec} {usage}".strip()
+                        break
+
+                # --- 步骤 C: 构造通用药学 Prompt (核心) ---
                 audit_prompt = f"""
-                你是一名临床药师。请审核【{target_drug}】在患者（{age_str}, {gender}）身上的用药风险。
+                你是一名前置审方系统的**临床药师**。请依据【医学证据】对【当前处方】进行合规性审核。
+
+                【患者档案】
+                - 概况：{age} {gender}
+                - 诊断：{diagnosis_str}
+                - 病史/指标：{full_history} (注意检查肝肾功能、过敏史)
+
+                【当前处方】
+                - **正在审核药物**：{target_drug_name}
+                - **该药具体用法**：{current_usage}
+                - **联合用药环境**：{all_meds_str} (注意检查与这些药的相互作用)
 
                 【医学证据片段】
                 {context_text}
 
-                【审查核心逻辑（请严格遵守）】
-                1. **适应症优先原则**：首先检查药物是否用于治疗患者的【诊断】。
-                   - 如果**对症**（如缺铁性贫血用铁剂），且用法用量正常，基础判定为**“低风险（通过）”**。
-                2. **禁忌症排查（无罪推定）**：
-                   - 只有当【患者病历】中**明确记载**了说明书中列出的“禁用”情况（如明确写了“胃溃疡”、“肝炎”）时，才判定为风险。
-                   - **如果病历未提及某疾病（如未提酒精中毒），默认患者没有该问题，严禁因此提示风险。**
-                3. **副作用/注意事项**：
-                   - 常规副作用（如恶心、便秘）属于正常告知范围，**不属于审核拦截的风险**，判定为低风险。
+                【审核任务：五维评估法】
+                请严格基于证据，按以下维度逐一排查。如果证据中未提及某维度，则默认通过。
 
-                【输出标准】
-                - **高风险**：患者病历中**明确存在**“禁用”条件（如：年龄不符、明确的过敏史、明确的禁忌症候）。
-                - **中风险**：用法用量严重超标，或存在严重的药物相互作用冲突。
-                - **低风险**：药物对症，用法在正常范围内，且病历中无明确禁忌证据。（即使说明书有很多慎用条款，只要患者没这些病，就是低风险）。
+                1. **适应症匹配 (Indication)**：
+                   - 药物是否用于治疗上述【诊断】？不对症即为不合理。
 
-                【输出要求】
-                简练回答，格式：“风险等级：X。理由：...”。引用证据时请注明片段来源。
+                2. **禁忌症红线 (Contraindication)**：
+                   - 检查患者的【年龄】、【性别】、【病史】是否命中说明书中的“禁用”条款。
+                   - **无罪推定原则**：如果病历未提及某具体疾病（如胃溃疡），默认患者无此病。
+
+                3. **用法用量审核 (Dosage - 关键)**：
+                   - **提取限制**：从证据中寻找“最大剂量”、“老年人剂量”、“肝肾功能不全剂量调整”的描述。
+                   - **数值比对**：将【该药具体用法】与证据中的限制进行比对。
+                   - **逻辑判定**：例如证据说“与胺碘酮合用不超过20mg”，而处方是“40mg”，则判定为高风险。
+
+                4. **药物相互作用 (Interactions)**：
+                   - 检查{target_drug_name}是否与【联合用药环境】中的其他药物有严重冲突（如增加毒性、横纹肌溶解、QT延长）。
+
+                5. **特殊人群 (Special Pop)**：
+                   - 针对{age}患者，是否有特殊的“慎用”或“减量”要求？
+
+                【输出规范】
+                请输出一段简练的药师审核意见。
+                - 必须明确给出风险等级：**高风险** (违反禁忌/超限/致死交互)、**中风险** (慎用/未减量)、**低风险** (正常)。
+                - 必须引用证据中的具体数值或条款作为理由。
                 """
 
-                # 2.4 调用 LLM
-                review_res = self.models.ollama.generate([
-                    {"role": "system", "content": "你是一个严谨的药师。注意区分不同药物的说明书，不要张冠李戴。"},
-                    {"role": "user", "content": audit_prompt}
-                ],
-                    model=self.smart_model
+                # --- 步骤 D: 推理 (Smart Model) ---
+                review_res = self.models.ollama.generate(
+                    [
+                        {"role": "system", "content": "你是一个严谨、客观的药学审核引擎。只根据提供的证据说话。"},
+                        {"role": "user", "content": audit_prompt}
+                    ],
+                    model=self.smart_model  # 必须用 7B+ 模型处理复杂逻辑
                 )
 
-                return {
-                    "query": query,
-                    "evidence_sources": sources,
-                    "ai_review": review_res
-                }
+                return {"query": query, "evidence_sources": sources, "ai_review": review_res}
 
             except Exception as e:
-                logger.error(f"审核查询 '{query}' 时发生错误: {e}")
-                return {"query": query, "ai_review": f"Error: {e}", "evidence_sources": []}
+                logger.error(f"审核查询 '{query}' 异常: {e}")
+                return {"query": query, "ai_review": f"系统错误: {e}", "evidence_sources": []}
 
-        # 3. 并发执行 (Map)
-        # max_workers=3 是一个保守值，适合大多数本地部署场景。
-        # 如果是高性能服务器，可以调大到 5-10。
+        # 3. 并发执行
         logger.info(f"开始并发审核 {len(queries)} 个查询...")
         with ThreadPoolExecutor(max_workers=3) as executor:
-            # 提交所有任务
             future_to_query = {executor.submit(_process_single_query, q): q for q in queries}
 
-            # 获取结果
             for future in as_completed(future_to_query):
                 try:
                     res = future.result()
                     results.append(res)
                 except Exception as exc:
-                    logger.error(f"并发任务执行异常: {exc}")
+                    logger.error(f"任务执行失败: {exc}")
 
-        # 4. 整体总结 (Reduce) - 保持不变
+        # 4. 最终决策汇总 (Reduce)
         if not results:
-            return {"details": [], "overall_analysis": {"final_decision": "通过", "summary_text": "无"}}
+            return {"details": [], "overall_analysis": {"final_decision": "通过", "summary_text": "无风险"}}
 
         try:
-            audit_trace = "\n".join([f"- {r['query']} -> {r['ai_review']}" for r in results])
-            summary_prompt = f"""
-            汇总药师审核结果，给出最终处方建议。
-            患者基本信息】
-            - 年龄：{age_str}
-            - 性别：{gender}
-            - 临床诊断：{diagnosis_str}
+            audit_trace = "\n".join([f"【针对 {r['query'].split(' ')[0]} 的审核】: {r['ai_review']}" for r in results])
 
-            【审核记录】
+            summary_prompt = f"""
+            我是科室主任。请根据下属药师的单项报告，汇总一份最终的【处方审核结论】。
+
+            【患者】{age} {gender}，诊断：{diagnosis_str}
+            【单项报告】
             {audit_trace}
 
-            【决策】高风险/禁用 -> 拦截；中风险 -> 人工复核；低风险 -> 通过。
+            【决策逻辑】
+            1. 只要有一个“高风险”，最终决策即为**拦截**。
+            2. 只有“中风险”且无高风险，决策为**人工复核**。
+            3. 全部低风险，决策为**通过**。
 
-            【输出 JSON】
-            {{ "final_decision": "...", "max_risk_level": "...", "summary_text": "...", "actionable_advice": "..." }}
+            【输出格式 (JSON Only)】
+            {{
+                "final_decision": "通过 / 拦截 / 人工复核",
+                "max_risk_level": "高 / 中 / 低",
+                "summary_text": "简明扼要的一句话总结（例如：辛伐他汀剂量超标，存在横纹肌溶解风险，建议拦截）。",
+                "actionable_advice": "给医生的具体修改建议。"
+            }}
             """
 
-            final_verdict_raw = self.models.ollama.generate([
-                {"role": "system", "content": "输出纯 JSON。"},
-                {"role": "user", "content": summary_prompt}
-            ],
+            final_verdict_raw = self.models.ollama.generate(
+                [{"role": "system", "content": "输出纯 JSON。"}, {"role": "user", "content": summary_prompt}],
                 model=self.smart_model
             )
 
-            import json, re, ast
+            import json, re
             match = re.search(r"\{[\s\S]*\}", final_verdict_raw)
             if match:
-                try:
-                    overall_analysis = json.loads(match.group(0))
-                except:
-                    overall_analysis = ast.literal_eval(match.group(0))
+                overall_analysis = json.loads(match.group(0))
             else:
                 overall_analysis = {"final_decision": "人工复核", "summary_text": final_verdict_raw}
 
@@ -839,6 +871,7 @@ class MedicalRAG:
             "details": results,
             "overall_analysis": overall_analysis
         }
+
     def review_record(self, medical_text: str) -> dict:
         """病历检阅主入口 (Extraction -> Decomposition -> Batch Audit)"""
         logger.info("开始病历检阅（review_record）")
@@ -854,7 +887,19 @@ class MedicalRAG:
 
         logger.info("病历检阅完成（JSON 已结构化）%s", extracted_data)
 
-        if not extracted_data.get("treatment_plan", {}).get("medications"):
+        # 1. 尝试从标准位置获取
+        meds = extracted_data.get("treatment_plan", {}).get("medications")
+
+        # 2. 如果没找到，尝试从根目录获取（兼容小模型）
+        if not meds:
+            meds = extracted_data.get("medications")
+            # 如果在根目录找到了，手动重建标准结构，方便后续代码调用
+            if meds:
+                extracted_data["treatment_plan"] = {"medications": meds}
+                logger.info("检测到扁平化 JSON 结构，已自动归一化。")
+
+        # 3. 再次检查
+        if not meds:
             logger.warning("未检测到处方信息，跳过用药审核步骤。")
             extracted_data["audit_report"] = "无处方信息，无法审核。"
             return extracted_data
