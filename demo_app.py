@@ -4,6 +4,7 @@ import json
 import os
 from rag_engine import MedicalRAG
 import logging
+from logging.handlers import RotatingFileHandler
 # ================= 页面配置 =================
 st.set_page_config(
     page_title="AI 药师工作台 (图谱增强版)",
@@ -11,31 +12,60 @@ st.set_page_config(
     layout="wide"
 )
 
+# === 配置区域 ===
+LOG_CONFIG = {
+    "log_dir": "logs",                  # 日志目录
+    "log_name": "medical_rag.log",      # 日志文件名
+    "max_bytes": 10 * 1024 * 1024,      # 单个文件最大 10MB
+    "backup_count": 5,                  # 保留 5 个备份文件 (总共约 60MB)
+    "encoding": "utf-8",
+    "level": logging.INFO
+}
 
 # 使用 Streamlit 的缓存机制，确保日志只配置一次，不会因为页面刷新而重复添加
 @st.cache_resource
-def setup_logging(log_file="logs/medical_rag.log"):
-    # 1. 获取根记录器
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
+def setup_logging():
+    # 1. 确保日志目录存在
+    if not os.path.exists(LOG_CONFIG["log_dir"]):
+        os.makedirs(LOG_CONFIG["log_dir"])
 
-    # 2. 清除已有的 FileHandler (防止重复写入)
-    # 注意：不要清除 StreamHandler，否则控制台看不到了
+    log_path = os.path.join(LOG_CONFIG["log_dir"], LOG_CONFIG["log_name"])
+
+    # 2. 获取根记录器
+    logger = logging.getLogger()
+    logger.setLevel(LOG_CONFIG["level"])
+
+    # 3. 清除已有的 FileHandler (防止 Streamlit 重载导致重复写入)
+    # 保留 StreamHandler 以便在终端看日志，只清理文件句柄
     for handler in logger.handlers[:]:
-        if isinstance(handler, logging.FileHandler):
+        if isinstance(handler, (logging.FileHandler, RotatingFileHandler)):
             logger.removeHandler(handler)
 
-    # 3. 创建新的 FileHandler
-    file_handler = logging.FileHandler(log_file, encoding='utf-8')
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
+    # 4. 创建 RotatingFileHandler (核心修改)
+    # mode='a': 追加模式
+    # maxBytes: 达到此字节数自动切割
+    # backupCount: 保留的文件个数，超过则删除最旧的
+    rotating_handler = RotatingFileHandler(
+        log_path,
+        maxBytes=LOG_CONFIG["max_bytes"],
+        backupCount=LOG_CONFIG["backup_count"],
+        encoding=LOG_CONFIG["encoding"]
+    )
 
-    # 4. 添加到根记录器
-    logger.addHandler(file_handler)
+    # 5. 设置格式
+    formatter = logging.Formatter(
+        '%(asctime)s - [%(threadName)s] - %(name)s - %(levelname)s - %(message)s'
+    )
+    rotating_handler.setFormatter(formatter)
 
-    print(f"日志系统已初始化，输出文件: {os.path.abspath(log_file)}")
+    # 6. 添加到记录器
+    logger.addHandler(rotating_handler)
+
+    print(f"✅ 日志轮转已配置: {os.path.abspath(log_path)}")
+    print(f"   - 单文件上限: {LOG_CONFIG['max_bytes'] / 1024 / 1024:.1f} MB")
+    print(f"   - 保留备份数: {LOG_CONFIG['backup_count']}")
+
     return logger
-
 
 # 执行初始化
 setup_logging()
